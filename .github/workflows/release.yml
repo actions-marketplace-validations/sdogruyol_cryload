@@ -53,6 +53,10 @@ jobs:
             artifact_name: cryload-macos
             binary_path: bin/cryload
           - os: windows-latest
+            # Without --static the exe dynamically links Crystal's bundled
+            # DLLs (pcre2-8, gc, libssl-3-x64, zlib1, iconv-2, ...) and
+            # fails to start on any machine without a Crystal toolchain.
+            build_flags: --static
             artifact_name: cryload-windows
             binary_path: bin/cryload.exe
     steps:
@@ -126,10 +130,23 @@ jobs:
         include:
           - artifact_name: cryload-linux
             smoke_os: ubuntu-latest
+            bin_name: cryload
+            python: python3
           - artifact_name: cryload-linux-arm64
             smoke_os: ubuntu-24.04-arm
+            bin_name: cryload
+            python: python3
           - artifact_name: cryload-macos
             smoke_os: macos-latest
+            bin_name: cryload
+            python: python3
+          # The smoke runner has no Crystal toolchain, so this doubles as a
+          # clean-machine test that the exe carries no DLL dependencies
+          # beyond the Windows system ones.
+          - artifact_name: cryload-windows
+            smoke_os: windows-latest
+            bin_name: cryload.exe
+            python: python
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -137,14 +154,15 @@ jobs:
           path: dist/${{ matrix.artifact_name }}
 
       - name: Verify version and run a short benchmark
+        shell: bash
         run: |
-          BIN="$PWD/dist/${{ matrix.artifact_name }}/cryload"
+          BIN="$PWD/dist/${{ matrix.artifact_name }}/${{ matrix.bin_name }}"
           chmod +x "$BIN"
           "$BIN" --version
 
           # Bind explicitly to IPv4 loopback and wait until the port accepts
           # connections. A fixed sleep is flaky when the runner is slow.
-          python3 -m http.server 8765 --bind 127.0.0.1 > /tmp/cryload-smoke-http.log 2>&1 &
+          ${{ matrix.python }} -m http.server 8765 --bind 127.0.0.1 > /tmp/cryload-smoke-http.log 2>&1 &
           server_pid=$!
           trap 'kill "$server_pid" 2>/dev/null || true' EXIT
           for _ in $(seq 1 50); do
@@ -174,8 +192,9 @@ jobs:
           fi
 
       - name: Verify HTTPS works (exercises static OpenSSL config/CA paths)
+        shell: bash
         run: |
-          BIN="$PWD/dist/${{ matrix.artifact_name }}/cryload"
+          BIN="$PWD/dist/${{ matrix.artifact_name }}/${{ matrix.bin_name }}"
           "$BIN" https://example.com -n 1 -c 1 --timeout 10 --no-progress --output-format quiet
 
   release:

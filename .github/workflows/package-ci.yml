@@ -64,10 +64,14 @@ jobs:
           # from reaching loopback on macOS 15+ runners (see the release.yml
           # smoke test, which works around it with sudo — not an option
           # inside a composite action).
+          #
+          # TODO: add windows-latest (python: python) once a release ships a
+          # statically linked Windows binary. The action installs the latest
+          # release, and Windows binaries up to v5.1.0 dynamically link
+          # Crystal's bundled DLLs, so they cannot start on a clean runner.
+          # release.yml now builds Windows with --static and smoke-tests it.
           - os: ubuntu-latest
             python: python3
-          - os: windows-latest
-            python: python
     steps:
       - uses: actions/checkout@v4
 
