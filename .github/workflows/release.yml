@@ -222,3 +222,161 @@ jobs:
             dist/cryload-macos/cryload-macos.sha256
             dist/cryload-windows/cryload-windows.exe
             dist/cryload-windows/cryload-windows.exe.sha256
+
+  docker-build:
+    name: Build Docker image (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    needs: smoke-test
+    # Publish images only for real release tags; workflow_dispatch runs
+    # skip the Docker jobs entirely.
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners for both architectures: Crystal compilation under
+          # QEMU emulation is an order of magnitude slower than native.
+          - platform: linux/amd64
+            os: ubuntu-latest
+          - platform: linux/arm64
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Dynamic OCI labels (version, revision, created); the static ones
+      # live in the Dockerfile.
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+
+      - name: Prepare platform slug
+        id: platform
+        run: echo "slug=$(echo '${{ matrix.platform }}' | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
+      # Push by digest only (no tags yet); docker-publish stitches the two
+      # digests into a single multi-arch manifest list and tags that.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=ghcr-${{ steps.platform.outputs.slug }}
+          cache-to: type=gha,mode=max,scope=ghcr-${{ steps.platform.outputs.slug }}
+
+      - name: Export digest
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "$RUNNER_TEMP/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ steps.platform.outputs.slug }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-publish:
+    name: Publish Docker image to GHCR
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Image tags follow the OCI convention without the v prefix:
+      # v5.1.0 -> 5.1.0, 5.1, 5, latest. Prerelease tags (e.g. v5.2.0-rc.1)
+      # only get their exact version tag — metadata-action skips the
+      # major/minor patterns and :latest for prereleases.
+      - name: Extract image tags
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - name: Create multi-arch manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          # Word splitting is intentional: the first $() expands to the
+          # "-t tag" list, the second to one image@digest per file.
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+
+      - name: Verify multi-arch manifest
+        run: |
+          out="$(docker buildx imagetools inspect "ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}")"
+          echo "$out"
+          for platform in linux/amd64 linux/arm64; do
+            echo "$out" | grep -q "Platform: *$platform" || {
+              echo "manifest list is missing $platform" >&2
+              exit 1
+            }
+          done
+
+  update-major-tag:
+    name: Update moving major tag
+    runs-on: ubuntu-latest
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Marketplace convention: `uses: sdogruyol/cryload@v5` tracks the
+      # latest v5.x.y release. Only stable semver tags move the major tag;
+      # prereleases are skipped. Tag pushes made with GITHUB_TOKEN do not
+      # retrigger this workflow, so this cannot loop.
+      - name: Force-push major tag
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Skipping major tag update for non-stable tag $tag"
+            exit 0
+          fi
+          major="${tag%%.*}"
+          git tag -f "$major" HEAD
+          git push -f origin "refs/tags/$major"

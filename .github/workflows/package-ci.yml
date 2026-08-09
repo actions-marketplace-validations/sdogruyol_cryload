@@ -1,0 +1,117 @@
+name: Package CI
+
+# PR-time verification for the two distribution channels that release.yml
+# publishes: the Docker image (GHCR) and the GitHub Action. Kept out of
+# ci.yml so spec runs stay fast and these jobs only run when the packaging
+# files change.
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "action.yml"
+      - "github-action/**"
+      - "scripts/install.sh"
+      - ".github/workflows/package-ci.yml"
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "action.yml"
+      - "github-action/**"
+      - "scripts/install.sh"
+      - ".github/workflows/package-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  docker-build:
+    name: Docker image build & smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: cryload:ci
+          cache-from: type=gha,scope=package-ci
+          cache-to: type=gha,mode=max,scope=package-ci
+
+      - name: Smoke test image
+        run: |
+          # --version proves the compile-time VERSION macro survived the
+          # Dockerfile's COPY layout; the HTTPS request exercises the CA
+          # bundle shipped in the runtime stage.
+          docker run --rm cryload:ci --version
+          docker run --rm cryload:ci https://example.com -n 1 -c 1 --timeout 10 --no-progress --output-format quiet
+
+  action-e2e:
+    name: Action e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS is skipped: Local Network Privacy blocks unsigned binaries
+          # from reaching loopback on macOS 15+ runners (see the release.yml
+          # smoke test, which works around it with sudo — not an option
+          # inside a composite action).
+          - os: ubuntu-latest
+            python: python3
+          - os: windows-latest
+            python: python
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit-test version resolver
+        shell: bash
+        run: sh github-action/test-resolve-version.sh
+
+      - name: Start local HTTP server
+        shell: bash
+        run: |
+          # Same readiness poll as the release.yml smoke test: bind IPv4
+          # loopback explicitly and wait until the port accepts connections.
+          ${{ matrix.python }} -m http.server 8765 --bind 127.0.0.1 > server.log 2>&1 &
+          for _ in $(seq 1 50); do
+            if curl -sf -o /dev/null --connect-timeout 1 "http://127.0.0.1:8765/"; then
+              exit 0
+            fi
+            sleep 0.1
+          done
+          echo "HTTP server not ready:" >&2
+          cat server.log >&2 || true
+          exit 1
+
+      # `uses: ./` installs the latest released binary and exercises the
+      # action's own logic (version resolution, argv building, outputs).
+      - name: Run action against local server
+        id: bench
+        uses: ./
+        with:
+          url: http://127.0.0.1:8765
+          requests: 20
+          connections: 2
+          timeout: 10
+          max_p99: "5000"
+
+      - name: Assert outputs
+        shell: bash
+        env:
+          REQUESTS: ${{ steps.bench.outputs.requests }}
+          P99: ${{ steps.bench.outputs.p99 }}
+          EXIT_CODE: ${{ steps.bench.outputs.exit_code }}
+          REPORT_JSON: ${{ steps.bench.outputs.json }}
+        run: |
+          test "$REQUESTS" = "20"
+          test -n "$P99"
+          test "$EXIT_CODE" = "0"
+          printf '%s' "$REPORT_JSON" | jq -e '.summary.requests == 20' > /dev/null

@@ -96,7 +96,27 @@ chmod +x cryload-linux
 ./cryload-linux --help
 ```
 
-### Option 3: Build from source
+### Option 3: Docker
+
+```bash
+docker run --rm ghcr.io/sdogruyol/cryload https://example.com -n 1000 -c 50
+```
+
+Multi-arch (amd64/arm64) image, ~9 MB. Use `--network host` on Linux to reach services on the host's localhost. Tags follow the release version without the `v` prefix: `5.1.0`, `5.1`, `5`, `latest`.
+
+### Option 4: GitHub Action
+
+```yaml
+- uses: sdogruyol/cryload@v5
+  with:
+    url: http://127.0.0.1:3000/api
+    requests: 500
+    max_p99: "250"
+```
+
+See [docs/github-action.md](docs/github-action.md) for all inputs and outputs.
+
+### Option 5: Build from source
 
 Requires Crystal >= 1.19.0.
 ```bash
@@ -166,6 +186,24 @@ cryload is built for pipelines. Use `--json` or `--output-format csv` for struct
 
 ### GitHub Actions example
 
+Use the official action — it installs cryload, runs the benchmark, and exposes the JSON results as step outputs:
+
+```yaml
+- name: Latency SLA
+  id: bench
+  uses: sdogruyol/cryload@v5
+  with:
+    url: http://localhost:3000/api
+    requests: 500
+    max_p99: "250"
+
+- name: Show p99
+  if: always()
+  run: echo "p99 was ${{ steps.bench.outputs.p99 }} ms"
+```
+
+See [docs/github-action.md](docs/github-action.md) for all inputs and outputs. Or install the binary directly:
+
 ```yaml
 - name: Install cryload
   run: curl -sSfL https://raw.githubusercontent.com/sdogruyol/cryload/master/scripts/install.sh | sh -s
@@ -213,7 +251,7 @@ Not yet. HTTP/1.1 only for now. HTTP/2 is on the roadmap.
 
 **Is there a Docker image?**
 
-Not yet. The single binary approach means you don't need Docker. Just download and run.
+Yes: `docker pull ghcr.io/sdogruyol/cryload`. The single binary is still the lightest option, but the image is handy for containerized pipelines (GitLab CI, Kubernetes jobs, etc.).
 
 **Why is it written in Crystal?**
 
