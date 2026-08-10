@@ -1,0 +1,188 @@
+---
+name: Cryload Load Test
+description: HTTP load testing for CI/CD — benchmark a URL with pass/fail latency and error-rate thresholds, and get JSON results as outputs
+branding:
+  icon: activity
+  color: orange
+
+# The action installs the prebuilt release binary (via scripts/install.sh)
+# and runs it directly on the runner — no container. That keeps it working
+# on Linux, macOS, and Windows runners and lets it reach services listening
+# on the runner's localhost, the primary CI use case.
+#
+# File-based flags (--body-file, --body-stdin, --urls-file, --random-path)
+# are intentionally not exposed as inputs: the install step puts `cryload`
+# on PATH, so follow-up `run:` steps can use the full CLI directly.
+
+inputs:
+  url:
+    description: Target URL to load test
+    required: true
+  requests:
+    description: Number of requests to make (-n)
+    required: false
+    default: ""
+  duration:
+    description: Test duration in seconds (-d); mutually exclusive with requests
+    required: false
+    default: ""
+  connections:
+    description: "Number of concurrent connections (-c, CLI default: 10)"
+    required: false
+    default: ""
+  method:
+    description: HTTP method (-m)
+    required: false
+    default: ""
+  body:
+    description: HTTP request body (-b)
+    required: false
+    default: ""
+  headers:
+    description: "HTTP headers, one 'Key: Value' per line (repeatable -H)"
+    required: false
+    default: ""
+  cookies:
+    description: Cookies, one name=value per line (repeatable --cookie)
+    required: false
+    default: ""
+  basic_auth:
+    description: HTTP Basic auth as user:password (-a)
+    required: false
+    default: ""
+  timeout:
+    description: Connect/read timeout in seconds (--timeout)
+    required: false
+    default: ""
+  rate:
+    description: Total request rate limit in requests/sec (-q)
+    required: false
+    default: ""
+  warmup:
+    description: Warmup seconds before the timed benchmark (--warmup)
+    required: false
+    default: ""
+  follow_redirects:
+    description: Follow HTTP redirects (-L)
+    required: false
+    default: "false"
+  disable_keepalive:
+    description: Open a new connection for every request (--disable-keepalive)
+    required: false
+    default: "false"
+  insecure:
+    description: Accept invalid TLS certificates (--insecure)
+    required: false
+    default: "false"
+  success_status:
+    description: Successful status codes/ranges, e.g. 200-299,301 (--success-status)
+    required: false
+    default: ""
+  user_agent:
+    description: Set the User-Agent header (--user-agent)
+    required: false
+    default: ""
+  host_header:
+    description: Override the Host header (--host-header)
+    required: false
+    default: ""
+  proxy:
+    description: HTTP(S) proxy URL (--proxy)
+    required: false
+    default: ""
+  fail_on_error:
+    description: Fail the step when any HTTP or transport error occurs (--fail-on-error)
+    required: false
+    default: "false"
+  fail_on_transport_error:
+    description: Fail the step when any transport error occurs (--fail-on-transport-error)
+    required: false
+    default: "false"
+  max_fail_rate:
+    description: Fail the step when failure rate exceeds this percentage (--max-fail-rate)
+    required: false
+    default: ""
+  max_p99:
+    description: Fail the step when p99 latency exceeds this many milliseconds (--max-p99)
+    required: false
+    default: ""
+  output_format:
+    description: "Output format: text, json, csv, quiet (--output-format). Structured outputs require json"
+    required: false
+    default: "json"
+  version:
+    description: cryload release tag to install (e.g. v5.1.0); defaults to the version matching the action ref, or the latest release for moving refs
+    required: false
+    default: ""
+
+outputs:
+  json:
+    description: Full JSON report (compact); empty unless output_format is json
+    value: ${{ steps.run.outputs.json }}
+  requests:
+    description: Total attempts (responses + transport errors)
+    value: ${{ steps.run.outputs.requests }}
+  requests_per_second:
+    description: Throughput in requests/sec
+    value: ${{ steps.run.outputs.requests_per_second }}
+  failure_rate_percent:
+    description: Failed HTTP responses + transport errors as a percentage of requests
+    value: ${{ steps.run.outputs.failure_rate_percent }}
+  p50:
+    description: Median latency in milliseconds
+    value: ${{ steps.run.outputs.p50 }}
+  p99:
+    description: p99 latency in milliseconds
+    value: ${{ steps.run.outputs.p99 }}
+  exit_code:
+    description: cryload's exit code (1 on threshold breach)
+    value: ${{ steps.run.outputs.exit_code }}
+
+runs:
+  using: composite
+  steps:
+    # Resolve the release tag from the ref this action was pinned with
+    # (exact tags install that exact release; v5/branch/SHA refs install the
+    # latest release), install the binary next to the workspace, and expose
+    # it to follow-up steps via PATH.
+    - name: Install cryload
+      shell: bash
+      env:
+        CRYLOAD_ACTION_REF: ${{ github.action_ref }}
+        INPUT_VERSION: ${{ inputs.version }}
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        version="$(sh "$GITHUB_ACTION_PATH/github-action/resolve-version.sh" "$INPUT_VERSION" "$CRYLOAD_ACTION_REF")"
+        install_dir="$RUNNER_TEMP/cryload-bin"
+        VERSION="$version" INSTALL_DIR="$install_dir" sh "$GITHUB_ACTION_PATH/scripts/install.sh"
+        echo "$install_dir" >> "$GITHUB_PATH"
+
+    - name: Run cryload
+      id: run
+      shell: bash
+      env:
+        INPUT_URL: ${{ inputs.url }}
+        INPUT_REQUESTS: ${{ inputs.requests }}
+        INPUT_DURATION: ${{ inputs.duration }}
+        INPUT_CONNECTIONS: ${{ inputs.connections }}
+        INPUT_METHOD: ${{ inputs.method }}
+        INPUT_BODY: ${{ inputs.body }}
+        INPUT_HEADERS: ${{ inputs.headers }}
+        INPUT_COOKIES: ${{ inputs.cookies }}
+        INPUT_BASIC_AUTH: ${{ inputs.basic_auth }}
+        INPUT_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_RATE: ${{ inputs.rate }}
+        INPUT_WARMUP: ${{ inputs.warmup }}
+        INPUT_FOLLOW_REDIRECTS: ${{ inputs.follow_redirects }}
+        INPUT_DISABLE_KEEPALIVE: ${{ inputs.disable_keepalive }}
+        INPUT_INSECURE: ${{ inputs.insecure }}
+        INPUT_SUCCESS_STATUS: ${{ inputs.success_status }}
+        INPUT_USER_AGENT: ${{ inputs.user_agent }}
+        INPUT_HOST_HEADER: ${{ inputs.host_header }}
+        INPUT_PROXY: ${{ inputs.proxy }}
+        INPUT_FAIL_ON_ERROR: ${{ inputs.fail_on_error }}
+        INPUT_FAIL_ON_TRANSPORT_ERROR: ${{ inputs.fail_on_transport_error }}
+        INPUT_MAX_FAIL_RATE: ${{ inputs.max_fail_rate }}
+        INPUT_MAX_P99: ${{ inputs.max_p99 }}
+        INPUT_OUTPUT_FORMAT: ${{ inputs.output_format }}
+      run: sh "$GITHUB_ACTION_PATH/github-action/run.sh"

@@ -8,10 +8,12 @@
 #   INSTALL_DIR=/usr/local/bin sh scripts/install.sh
 #
 # Environment:
-#   REPO         GitHub repo (default: sdogruyol/cryload)
-#   VERSION      Release tag, e.g. v3.0.0 or 3.0.0; default: latest GitHub release
-#   INSTALL_DIR  Directory for the binary (default: $HOME/.local/bin)
-#   GITHUB_URL   Override base URL for enterprise mirrors (default: https://github.com)
+#   REPO          GitHub repo (default: sdogruyol/cryload)
+#   VERSION       Release tag, e.g. v3.0.0 or 3.0.0; default: latest GitHub release
+#   INSTALL_DIR   Directory for the binary (default: $HOME/.local/bin)
+#   GITHUB_URL    Override base URL for enterprise mirrors (default: https://github.com)
+#   GITHUB_TOKEN  Optional token for the latest-release API lookup; anonymous
+#                 requests are heavily rate-limited on shared CI runner IPs
 
 set -eu
 
@@ -25,10 +27,11 @@ cryload install script
 Cross-platform HTTP load testing CLI: a modern ab/wrk alternative with machine-readable reports for CI/CD
 
 Environment variables:
-  REPO         GitHub repository (default: sdogruyol/cryload)
-  VERSION      Tag to install (e.g. v3.0.0); default: latest release
-  INSTALL_DIR  Install destination (default: \$HOME/.local/bin)
-  GITHUB_URL   GitHub base URL (default: https://github.com)
+  REPO          GitHub repository (default: sdogruyol/cryload)
+  VERSION       Tag to install (e.g. v3.0.0); default: latest release
+  INSTALL_DIR   Install destination (default: \$HOME/.local/bin)
+  GITHUB_URL    GitHub base URL (default: https://github.com)
+  GITHUB_TOKEN  Optional token for the latest-release API lookup
 
 Example:
   curl -sSfL ${GITHUB_URL}/${REPO}/raw/master/scripts/install.sh | sh -s
@@ -55,12 +58,23 @@ fetch() {
   fi
 }
 
+# Used for the GitHub API lookup only; authenticates when GITHUB_TOKEN is
+# set so CI runs (e.g. the GitHub Action) don't hit the anonymous per-IP
+# rate limit shared across hosted runners.
 fetch_stdout() {
   url="$1"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url"
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+      curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" "$url"
+    else
+      curl -fsSL "$url"
+    fi
   elif command -v wget >/dev/null 2>&1; then
-    wget -q -O - "$url"
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+      wget -q -O - --header="Authorization: Bearer ${GITHUB_TOKEN}" "$url"
+    else
+      wget -q -O - "$url"
+    fi
   else
     echo "install.sh: need curl or wget" >&2
     exit 1
@@ -68,7 +82,16 @@ fetch_stdout() {
 }
 
 resolve_latest_tag() {
-  json="$(fetch_stdout "https://api.github.com/repos/${REPO}/releases/latest")"
+  # Derive the API host from GITHUB_URL so enterprise mirrors query their
+  # own API (GHES serves the REST API under /api/v3) — and so a GITHUB_TOKEN
+  # meant for the mirror is never sent to public api.github.com.
+  base="${GITHUB_URL%/}"
+  if [ "$base" = "https://github.com" ]; then
+    api_url="https://api.github.com/repos/${REPO}/releases/latest"
+  else
+    api_url="${base}/api/v3/repos/${REPO}/releases/latest"
+  fi
+  json="$(fetch_stdout "$api_url")"
   tag="$(printf '%s' "$json" | tr -d '\r' | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)"
   if [ -z "$tag" ]; then
     echo "install.sh: could not resolve latest release tag" >&2

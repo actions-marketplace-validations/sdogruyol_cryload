@@ -1,0 +1,13 @@
+# The build stage only COPYs shard.yml and src/, but keeping the context
+# small speeds up every build and keeps host-local state (bin/, lib/,
+# shard.lock is gitignored) from leaking into the image.
+.git/
+.github/
+assets/
+bin/
+docs/
+lib/
+scripts/
+spec/
+*.md
+shard.lock
