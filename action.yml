@@ -1,6 +1,6 @@
 ---
 name: Cryload Load Test
-description: HTTP load testing for CI/CD — benchmark a URL with pass/fail latency and error-rate thresholds, and get JSON results as outputs
+description: HTTP load testing for CI/CD — benchmark a URL with pass/fail latency and error-rate thresholds, and JSON step outputs
 branding:
   icon: activity
   color: orange

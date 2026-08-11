@@ -1,3 +1,7 @@
+# 5.2.1 (11-08-2026)
+
+- **GitHub Action** — Shortened the `action.yml` description to 117 characters; GitHub Marketplace rejects listings whose description is 125 characters or longer, which blocked publishing v5.2.0
+
 # 5.2.0 (11-08-2026)
 
 - **Distribution** — Added a Docker image at [`ghcr.io/sdogruyol/cryload`](https://github.com/sdogruyol/cryload/pkgs/container/cryload): multi-arch (amd64/arm64), ~9 MB Alpine runtime around the same fully static binary as the Linux release
