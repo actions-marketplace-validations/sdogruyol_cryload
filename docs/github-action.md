@@ -16,7 +16,7 @@ The action installs the prebuilt release binary and runs it directly on the runn
 
 > **macOS runners:** Local Network Privacy on macOS 15+ blocks unsigned binaries from reaching loopback addresses, so localhost targets may time out there. Prefer Linux runners for localhost benchmarks.
 >
-> **Windows runners:** requires a cryload release newer than v5.1.0 — earlier Windows binaries were dynamically linked against the Crystal toolchain's DLLs and fail to start on clean runners.
+> **Windows runners:** requires cryload v5.2.0 or newer — earlier Windows binaries were dynamically linked against the Crystal toolchain's DLLs and fail to start on clean runners.
 
 ## Versioning
 
@@ -24,11 +24,11 @@ The installed binary version follows the ref the action is pinned to:
 
 | `uses:` ref | Installed binary |
 |-------------|------------------|
-| `sdogruyol/cryload@v5.1.0` | That exact release (reproducible) |
+| `sdogruyol/cryload@v5.2.0` | That exact release (reproducible) |
 | `sdogruyol/cryload@v5` | Latest release |
 | branch / commit SHA | Latest release |
 
-Set the `version` input to override, e.g. `version: v5.1.0`.
+Set the `version` input to override, e.g. `version: v5.2.0`.
 
 ## Inputs
 

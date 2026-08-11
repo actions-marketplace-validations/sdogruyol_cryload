@@ -102,7 +102,7 @@ chmod +x cryload-linux
 docker run --rm ghcr.io/sdogruyol/cryload https://example.com -n 1000 -c 50
 ```
 
-Multi-arch (amd64/arm64) image, ~9 MB. Use `--network host` on Linux to reach services on the host's localhost. Tags follow the release version without the `v` prefix: `5.1.0`, `5.1`, `5`, `latest`.
+Multi-arch (amd64/arm64) image, ~9 MB. Use `--network host` on Linux to reach services on the host's localhost. Tags follow the release version without the `v` prefix: `5.2.0`, `5.2`, `5`, `latest`.
 
 ### Option 4: GitHub Action
 

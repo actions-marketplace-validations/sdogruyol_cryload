@@ -1,3 +1,27 @@
+# 5.2.0 (11-08-2026)
+
+- **Distribution** — Added a Docker image at [`ghcr.io/sdogruyol/cryload`](https://github.com/sdogruyol/cryload/pkgs/container/cryload): multi-arch (amd64/arm64), ~9 MB Alpine runtime around the same fully static binary as the Linux release
+
+```bash
+docker run --rm ghcr.io/sdogruyol/cryload https://example.com -n 1000 -c 50
+```
+
+- **Distribution** — Added a composite GitHub Action so cryload runs in a workflow step with thresholds and JSON results as step outputs; every CLI flag is exposed as an input, and `uses: sdogruyol/cryload@v5` tracks the latest v5 release
+
+```yaml
+- uses: sdogruyol/cryload@v5
+  with:
+    url: http://127.0.0.1:3000/api
+    requests: 500
+    max_p99: "250"
+```
+
+- **Releases** — Windows release binaries are now linked statically; earlier builds dynamically linked the Crystal toolchain's DLLs and failed to start on machines without Crystal installed
+- **Releases** — Release smoke tests now cover Windows, so a broken Windows binary fails the release instead of shipping
+- **Installer** — `scripts/install.sh` uses `GITHUB_TOKEN` for the latest-release API lookup when set, avoiding the anonymous per-IP rate limit shared across hosted CI runners
+- **Installer** — `GITHUB_URL` now also redirects the release API lookup, so enterprise mirrors query their own `/api/v3` endpoint and a mirror token is never sent to public GitHub
+- **Documentation** — Added [docs/github-action.md](docs/github-action.md) with the full input/output reference and version-pinning rules
+
 # 5.1.0 (01-08-2026)
 
 - **Releases** — Linux release binaries are now fully static (musl/Alpine), so they run on any distro without matching glibc/OpenSSL versions
