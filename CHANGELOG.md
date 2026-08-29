@@ -1,3 +1,55 @@
+# 6.0.0 (29-08-2026)
+
+- **Breaking (Concurrency)** — Multi-core load generation is now the default. v5 ran every load fiber on a single thread; v6 sizes the execution context to `min(cpu_count, connections)` OS threads and exposes it as `--workers N`. `--workers 1` reproduces the v5 single-core path; the cpu default respects `CRYSTAL_WORKERS`
+- **Breaking (Accuracy)** — Threshold gates now evaluate **corrected** latency by default (`--latency-correction on`). A run that passed `--max-p99` in v5 can fail in v6 when the target could not keep up with `--rate`; corrected and uncorrected latency are identical when `--rate` is not set. Pass `--latency-correction off` for v5 gate semantics
+- **Breaking (Exit codes)** — Exit codes are now a taxonomy instead of a single failure code: usage/config errors moved from `1` to `2`, an unreachable target (zero HTTP responses plus at least one transport error) moved from `1` to `3`, and signals now exit `130` (SIGINT) / `143` (SIGTERM) instead of `0`. `1` is reserved for breached thresholds, and a breached threshold takes precedence over a signal code
+
+| Code | Meaning |
+|---|---|
+| 0 | Run finished, no threshold breached |
+| 1 | A threshold was breached |
+| 2 | Usage/config error |
+| 3 | Target unreachable |
+| 130 | Interrupted (SIGINT) |
+| 143 | Terminated (SIGTERM) |
+
+- **Breaking (Reporting)** — Transport error categories are a fixed, normalized vocabulary instead of Crystal exception class names: `dns_failure`, `connect_refused`, `connect_timeout`, `connect_failed`, `read_timeout`, `write_timeout`, `request_timeout`, `connection_reset`, `connection_closed`, `tls_error`, `proxy_error`, `protocol_error`, `other`. Consumers matching on `IO::TimeoutError` or `Socket::ConnectError` must switch to the new names
+- **Breaking (JSON)** — JSON output gained a top-level `schema_version`, currently `1`. Every documented key is always present and is `null` when not applicable, so consumers can stop probing for key existence
+- **Breaking (CLI)** — `--progress` now defaults to on only when stderr is a TTY, so CI logs are clean without passing `--no-progress`. Explicit `--progress` still forces it on
+- **Breaking (Toolchain)** — Minimum Crystal is now **1.21.0** (was 1.19.0); multi-core load generation uses `Fiber::ExecutionContext.default.resize`
+- **Performance** — `--workers 8 -c 128` reaches a median **329,440 req/s** against a `SO_REUSEPORT` target on loopback, versus **109,161 req/s** on the single-thread `--workers 1` path — a 3.0x gain (AMD Ryzen AI 9 465, 20 threads, 2-byte body, median of 5 three-second runs). `--workers 16` measures *slower* (280,079 req/s) than `--workers 8` on the same box, which is why the default is `min(cpu cores, connections)` rather than every core
+- **Performance** — Response bodies are streamed through one fixed buffer per worker instead of being materialised as a `String`, so peak RSS no longer scales with response size: 22.9 MB at `--workers 8 -c 128` with 2-byte bodies, 12.9 MB at `--workers 8 -c 32` with 100 KB bodies
+- **Accuracy** — Added coordinated-omission correction. v5 measured latency only from the moment a request was actually sent, so a stalled target made the numbers *look better*: in a regression test that froze the target for 1 second during `-q 500 -d 5`, v5 reported **p99 = 0.37 ms** while silently dropping 490 of 2500 scheduled requests. v6 reports the outage in `corrected_latency_ms.p99` and surfaces the loss as `rate.skipped_requests`
+- **Accuracy** — Added a `rate` block reporting requested vs attained req/s, attainment percent, scheduled and skipped requests, and schedule drift, so a rate-limited run can no longer claim a rate it never achieved
+- **Accuracy** — Added `send_delay_ms` percentiles, the gap between a request's scheduled send time and its actual send time
+- **Accuracy** — `--timeout` now sets the **write** timeout as well as connect and read; v5 left writes unbounded
+- **Accuracy** — `-q` / `--rate` accepts fractional rates (`-q 0.5`)
+- **CI/CD** — Added a full threshold matrix: `--max-p50`, `--max-p75`, `--max-p90`, `--max-p95`, `--max-p999`, `--max-avg`, and `--max-latency` alongside the existing `--max-p99`
+- **CI/CD** — Added `--min-rps N` to fail a build when throughput drops below a floor
+- **CI/CD** — Added `--fail-on-rate-miss` to exit 1 when the attained rate is more than 1% below the requested `--rate`
+- **CI/CD** — Added repeatable per-endpoint gates via `--url-threshold "PATTERN METRIC VALUE"`, where `PATTERN` is a substring matched against the target URLs and `METRIC` is one of `max-p50 max-p75 max-p90 max-p95 max-p99 max-p999 max-avg max-latency max-fail-rate min-rps`. A pattern matching no target URL is a config error (exit 2)
+
+```bash
+cryload --urls-file urls.txt -d 30 \
+  --url-threshold "/api/users max-p99 120" \
+  --url-threshold "/api/search max-p99 400" \
+  --min-rps 2000
+```
+
+- **CI/CD** — JSON output gained a `thresholds` block listing every evaluated gate with its scope, metric, comparator, limit, actual value and pass state, plus a `verdict` block carrying the exit code and reason
+- **Load testing** — `-d`/`--duration`, `--timeout` and `--warmup` accept duration units: `30`, `30s`, `2m`, `1h30m`, `500ms`. A bare number is still seconds
+- **Observability** — Added a latency phase breakdown (`phases_ms`) for dns, connect, tls, ttfb and total, so a slow run can be attributed to handshake cost versus server think time. dns/connect/tls are per **connection**, so with keep-alive their `count` is the number of connections opened
+- **Observability** — Added a per-status breakdown (`by_status`) with latency percentiles per HTTP status code, so error responses can be distinguished from slow successes
+- **Observability** — Added a per-URL breakdown (`by_url`) for multi-URL runs, with per-endpoint throughput, failure rate and percentiles. It is `null` for single-URL runs and for target lists over 1000 URLs
+- **Observability** — Text output header gained `Workers:`, `Latency correction:` and `Request timeout:` lines, and the report gained `Corrected Latency Percentiles`, `Rate`, `Latency Phases`, `Per-URL` and `Thresholds` blocks
+- **Observability** — CSV output appends the new v6 columns after the existing v5 columns in their original order, so header-indexed consumers keep working unchanged
+- **Resilience** — Added `--request-timeout DURATION`, a total wall-clock deadline for one request including body download. It catches slow-trickle responses that never trip the per-operation `--timeout` and reports them as `request_timeout`
+- **Resilience** — Added a file-descriptor preflight: cryload checks `RLIMIT_NOFILE` (POSIX only) and raises the soft limit toward the hard limit when it is below `connections + 64`. If it still cannot get there, it exits 2 naming the current and required limits instead of failing mid-run with connect errors
+- **Documentation** — Rewrote [docs/json-output.md](docs/json-output.md) for schema version 1, including every null-value rule and a v5 migration section
+- **Documentation** — Added [docs/examples.md](docs/examples.md), a cookbook of runnable commands covering request modes, bodies, auth, multi-URL, rate limiting, phase diagnosis, CI gates and exit-code handling
+- **Documentation** — README performance table replaced with measured numbers and a methodology note; the inconsistent `~50,000 req/sec` claim is gone, and a new **Honest latency** section explains coordinated omission
+- **Documentation** — Updated [docs/comparison.md](docs/comparison.md) with rows for coordinated-omission correction, latency phase breakdown, per-URL/per-status breakdown, per-endpoint gates, exit code taxonomy and total request deadline
+
 # 5.2.1 (11-08-2026)
 
 - **GitHub Action** — Shortened the `action.yml` description to 117 characters; GitHub Marketplace rejects listings whose description is 125 characters or longer, which blocked publishing v5.2.0
