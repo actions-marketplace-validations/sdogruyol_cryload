@@ -21,3 +21,28 @@ jobs:
 
       - name: Run specs
         run: crystal spec
+
+  # A type error can be platform-specific: the Windows IOCP event loop rejects a
+  # numeric socket timeout that type-checks fine on Unix, so a release-breaking
+  # error can sit on master until the tag build reaches the Windows runner.
+  # --cross-compile type-checks each release target without needing a linker.
+  cross-compile:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: crystal-lang/install-crystal@v1
+        with:
+          crystal: "1.21.0"
+
+      - name: Type-check for ${{ matrix.target }}
+        run: crystal build src/main.cr --cross-compile --target ${{ matrix.target }} -o /tmp/cryload-${{ matrix.target }} --no-debug
