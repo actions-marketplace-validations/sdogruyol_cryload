@@ -10,41 +10,43 @@ module Cryload
 
       if @show_version
         puts "cryload #{Cryload::VERSION}"
-        exit 0
+        exit ExitCode::Ok.value
       end
 
       if @show_help
-        exit(@parse_error ? 1 : 0)
+        exit(@parse_error ? ExitCode::ConfigError.value : ExitCode::Ok.value)
       end
 
       unless Validator.validate(@options) { |message| print_start_message(message) }
-        exit 1
+        exit ExitCode::ConfigError.value
       end
 
-      connections = @options.connections
       urls = OptionsBuilder.resolve_urls(@options)
-      display_url = Cryload.display_url(urls)
-      output_format = OptionsBuilder.resolve_output_format(@options)
-      method = @options.method
-      body = OptionsBuilder.resolve_body(@options)
-      timeout_seconds = @options.timeout
-      rate_limit = @options.rate
-      insecure = @options.insecure?
-      follow_redirects = @options.follow_redirects?
-      success_status_ranges = Validator.parse_success_status_ranges(@options.success_status)
-      headers = OptionsBuilder.build_headers(@options)
-      ci_thresholds = OptionsBuilder.build_ci_thresholds(@options)
-      warmup_seconds = @options.warmup || 0
-      progress = @options.progress?
-      random_path = @options.random_path?
-      disable_keepalive = @options.disable_keepalive?
-      proxy = OptionsBuilder.resolve_proxy(@options)
 
-      if duration = @options.duration
-        Cryload::LoadGenerator.new display_url, nil, connections, duration, output_format, method, body, headers, timeout_seconds, insecure, rate_limit, follow_redirects, success_status_ranges, ci_thresholds, urls, warmup_seconds, proxy, progress, random_path, disable_keepalive
-      elsif numbers = @options.numbers
-        Cryload::LoadGenerator.new display_url, numbers, connections, nil, output_format, method, body, headers, timeout_seconds, insecure, rate_limit, follow_redirects, success_status_ranges, ci_thresholds, urls, warmup_seconds, proxy, progress, random_path, disable_keepalive
-      end
+      Cryload::LoadGenerator.new(
+        host: Cryload.display_url(urls),
+        request_number: @options.numbers,
+        connections: @options.connections,
+        duration: @options.duration,
+        output_format: OptionsBuilder.resolve_output_format(@options),
+        http_method: @options.method,
+        http_body: OptionsBuilder.resolve_body(@options),
+        http_headers: OptionsBuilder.build_headers(@options),
+        timeouts: OptionsBuilder.build_timeouts(@options),
+        insecure: @options.insecure?,
+        rate_limit: @options.rate,
+        follow_redirects: @options.follow_redirects?,
+        success_status_ranges: Validator.parse_success_status_ranges(@options.success_status),
+        ci_thresholds: OptionsBuilder.build_ci_thresholds(@options),
+        urls: urls,
+        warmup: @options.warmup || Time::Span.zero,
+        proxy: OptionsBuilder.resolve_proxy(@options),
+        progress: OptionsBuilder.resolve_progress(@options),
+        random_path: @options.random_path?,
+        disable_keepalive: @options.disable_keepalive?,
+        latency_correction: @options.latency_correction?,
+        workers: @options.workers,
+      )
     end
 
     private def prepare_op
@@ -60,8 +62,12 @@ module Cryload
             @options.connections = parse_int(v, "-c/--connections")
           end
 
-          opts.on("-d SECONDS", "--duration SECONDS", "Duration of test in seconds (e.g. -d 10 for 10 seconds)") do |v|
-            @options.duration = parse_int(v, "-d/--duration")
+          opts.on("-d DURATION", "--duration DURATION", "Duration of test (30, 30s, 2m, 1h30m; bare number = seconds)") do |v|
+            @options.duration = parse_duration(v, "-d/--duration")
+          end
+
+          opts.on("--workers COUNT", "Load-generator threads (default: min(cpu cores, connections))") do |v|
+            @options.workers = parse_int(v, "--workers")
           end
 
           opts.on("-m METHOD", "--method METHOD", "HTTP method (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS)") do |v|
@@ -96,12 +102,16 @@ module Cryload
             @options.basic_auth = v
           end
 
-          opts.on("--timeout SECONDS", "Client connect/read timeout in seconds") do |v|
-            @options.timeout = parse_int(v, "--timeout")
+          opts.on("--timeout DURATION", "Client connect/read/write timeout (e.g. 5, 5s, 500ms)") do |v|
+            @options.timeout = parse_duration(v, "--timeout")
           end
 
-          opts.on("-q RATE", "--rate RATE", "Total request rate limit in requests/sec") do |v|
-            @options.rate = parse_int(v, "-q/--rate")
+          opts.on("--request-timeout DURATION", "Total deadline per request including body download") do |v|
+            @options.request_timeout = parse_duration(v, "--request-timeout")
+          end
+
+          opts.on("-q RATE", "--rate RATE", "Total request rate limit in requests/sec (fractional allowed)") do |v|
+            @options.rate = parse_float(v, "-q/--rate")
           end
 
           opts.on("-L", "--follow-redirects", "Follow HTTP redirects (up to 5 hops)") do
@@ -128,24 +138,51 @@ module Cryload
             @options.json = true
           end
 
-          opts.on("--fail-on-error", "Exit with code 1 when any HTTP or transport error occurs") do
+          opts.on("--latency-correction MODE", "Gate on coordinated-omission corrected latency: on (default) or off") do |v|
+            @options.latency_correction = parse_toggle(v, "--latency-correction")
+          end
+
+          opts.on("--fail-on-error", "Exit 1 when any HTTP or transport error occurs") do
             @options.fail_on_error = true
           end
 
-          opts.on("--fail-on-transport-error", "Exit with code 1 when any transport error occurs") do
+          opts.on("--fail-on-transport-error", "Exit 1 when any transport error occurs") do
             @options.fail_on_transport_error = true
           end
 
-          opts.on("--max-fail-rate PERCENT", "Exit with code 1 when failure rate exceeds PERCENT") do |v|
+          opts.on("--fail-on-rate-miss", "Exit 1 when the attained rate falls below --rate") do
+            @options.fail_on_rate_miss = true
+          end
+
+          opts.on("--max-fail-rate PERCENT", "Exit 1 when failure rate exceeds PERCENT") do |v|
             @options.max_fail_rate = parse_float(v, "--max-fail-rate")
           end
 
-          opts.on("--max-p99 MS", "Exit with code 1 when p99 latency exceeds MS milliseconds") do |v|
-            @options.max_p99_ms = parse_float(v, "--max-p99")
+          opts.on("--min-rps RATE", "Exit 1 when throughput falls below RATE requests/sec") do |v|
+            @options.min_rps = parse_float(v, "--min-rps")
           end
 
-          opts.on("--warmup SECONDS", "Warm up before the timed benchmark (seconds)") do |v|
-            @options.warmup = parse_int(v, "--warmup")
+          {
+            "--max-p50"     => {Threshold::Metric::P50, "p50"},
+            "--max-p75"     => {Threshold::Metric::P75, "p75"},
+            "--max-p90"     => {Threshold::Metric::P90, "p90"},
+            "--max-p95"     => {Threshold::Metric::P95, "p95"},
+            "--max-p99"     => {Threshold::Metric::P99, "p99"},
+            "--max-p999"    => {Threshold::Metric::P999, "p999"},
+            "--max-avg"     => {Threshold::Metric::Avg, "average"},
+            "--max-latency" => {Threshold::Metric::MaxLatency, "slowest"},
+          }.each do |flag, (metric, label)|
+            opts.on("#{flag} MS", "Exit 1 when #{label} latency exceeds MS milliseconds") do |v|
+              @options.max_latency[metric] = parse_float(v, flag)
+            end
+          end
+
+          opts.on("--url-threshold RULE", "Per-endpoint gate: 'PATTERN METRIC VALUE', repeatable") do |v|
+            @options.url_thresholds << v
+          end
+
+          opts.on("--warmup DURATION", "Warm up before the timed benchmark (e.g. 3, 3s)") do |v|
+            @options.warmup = parse_duration(v, "--warmup")
           end
 
           opts.on("--proxy URL", "HTTP(S) proxy (e.g. http://127.0.0.1:8080 or http://user:pass@proxy:8080)") do |v|
@@ -156,7 +193,7 @@ module Cryload
             @options.progress = false
           end
 
-          opts.on("--progress", "Show live progress on stderr during the run (default)") do
+          opts.on("--progress", "Force live progress on stderr (default: only when stderr is a TTY)") do
             @options.progress = true
           end
 
@@ -204,6 +241,21 @@ module Cryload
 
     private def parse_float(value : String, flag : String) : Float64
       value.to_f? || raise OptionParser::Exception.new("Invalid value '#{value}' for #{flag}: expected a number")
+    end
+
+    private def parse_duration(value : String, flag : String) : Time::Span
+      Duration.parse(value, flag)
+    rescue ex : ArgumentError
+      raise OptionParser::Exception.new(ex.message)
+    end
+
+    private def parse_toggle(value : String, flag : String) : Bool
+      case value.downcase
+      when "on", "true", "1"   then true
+      when "off", "false", "0" then false
+      else
+        raise OptionParser::Exception.new("Invalid value '#{value}' for #{flag}: expected 'on' or 'off'")
+      end
     end
 
     private def print_start_message(message : String)

@@ -1,146 +1,210 @@
 module Cryload
-  # Stats holder for the benchmark
+  # Immutable description of the run, carried into the report so a JSON artifact
+  # is self-describing.
+  struct RunConfig
+    getter workers : Int32
+    getter connections : Int32
+    getter rate_limit : Float64?
+    getter? latency_correction : Bool
+    getter? keepalive : Bool
+    getter timeout : Time::Span?
+    getter request_timeout : Time::Span?
+    getter duration : Time::Span?
+    getter warmup : Time::Span?
+    getter request_number : Int32?
+
+    def initialize(
+      @workers : Int32 = 1,
+      @connections : Int32 = 10,
+      @rate_limit : Float64? = nil,
+      @latency_correction : Bool = true,
+      @keepalive : Bool = true,
+      @timeout : Time::Span? = nil,
+      @request_timeout : Time::Span? = nil,
+      @duration : Time::Span? = nil,
+      @warmup : Time::Span? = nil,
+      @request_number : Int32? = nil,
+    )
+    end
+  end
+
+  # Stats holder for the benchmark.
   class Stats
-    # HDR-style logarithmic histogram: ~1% relative precision from 1µs to 1h
-    # in a few thousand buckets, instead of a dense linear bucket array.
-    HISTOGRAM_MIN_MS       =       0.001
-    HISTOGRAM_MAX_MS       = 3_600_000.0
-    HISTOGRAM_GROWTH       =        1.01
-    HISTOGRAM_LOG_GROWTH   = Math.log(HISTOGRAM_GROWTH)
-    HISTOGRAM_BUCKET_COUNT = (Math.log(HISTOGRAM_MAX_MS / HISTOGRAM_MIN_MS) / HISTOGRAM_LOG_GROWTH).ceil.to_i + 1
+    # Per-URL histograms are bounded: a cache-busting list of tens of thousands
+    # of URLs would spend more memory on the breakdown than the run is worth,
+    # and per-URL percentiles over a handful of samples each are meaningless.
+    PER_URL_LIMIT = 1000
 
-    def self.histogram_bucket_index(value_ms : Float64) : Int32
-      return 0 if value_ms <= HISTOGRAM_MIN_MS
+    # One completed response, moved from a worker into its batch. A struct so
+    # the hot path stays allocation-free.
+    struct Sample
+      getter url_index : Int32
+      getter status_code : Int32
+      getter total_ms : Float64
+      getter corrected_ms : Float64
+      getter send_delay_ms : Float64
+      getter ttfb_ms : Float64
+      getter response_bytes : Int64
+      getter dns_ms : Float64?
+      getter connect_ms : Float64?
+      getter tls_ms : Float64?
 
-      index = (Math.log(value_ms / HISTOGRAM_MIN_MS) / HISTOGRAM_LOG_GROWTH).floor.to_i
-      {index, HISTOGRAM_BUCKET_COUNT - 1}.min
+      def initialize(
+        @url_index : Int32,
+        @status_code : Int32,
+        @total_ms : Float64,
+        @corrected_ms : Float64,
+        @send_delay_ms : Float64,
+        @ttfb_ms : Float64,
+        @response_bytes : Int64,
+        @dns_ms : Float64? = nil,
+        @connect_ms : Float64? = nil,
+        @tls_ms : Float64? = nil,
+      )
+      end
     end
 
-    # Geometric midpoint of the bucket, the best estimate for values in it.
-    def self.histogram_bucket_value(index : Int32) : Float64
-      HISTOGRAM_MIN_MS * (HISTOGRAM_GROWTH ** (index + 0.5))
+    # Worker-local per-URL slice.
+    class UrlBatch
+      property requests = 0_i64
+      property responses = 0_i64
+      property transport_errors = 0_i64
+      property ok = 0_i64
+      property failed = 0_i64
+      getter latency = Histogram::Sparse.new
+    end
+
+    # Global per-URL slice.
+    class UrlStats
+      property requests = 0_i64
+      property responses = 0_i64
+      property transport_errors = 0_i64
+      property ok = 0_i64
+      property failed = 0_i64
+      getter latency = Histogram::Dense.new
+
+      def merge(batch : UrlBatch) : Nil
+        @requests += batch.requests
+        @responses += batch.responses
+        @transport_errors += batch.transport_errors
+        @ok += batch.ok
+        @failed += batch.failed
+        @latency.merge batch.latency
+      end
+
+      def failure_rate_percent : Float64
+        return 0.0 if @requests == 0
+        ((@failed + @transport_errors).to_f / @requests) * 100.0
+      end
     end
 
     # Worker-local stats batch flushed periodically to the global collector.
     class Batch
-      @success_status_ranges : Array(Range(Int32, Int32))
-      @total_request_count : Int64
-      @response_count : Int64
-      @total_response_bytes : Int64
-      @ok_requests : Int64
-      @not_ok_requests : Int64
-      @transport_error_count : Int64
-      @total_request_time_ms : Float64
-      @min_request_time_ms : Float64
-      @max_request_time_ms : Float64
-      @mean_latency_ms : Float64
-      @m2_latency_ms : Float64
-      @latency_buckets : Hash(Int32, Int64)
-      @status_code_counts : Hash(Int32, Int64)
-      @error_counts : Hash(String, Int64)
+      getter total_request_count = 0_i64
+      getter response_count = 0_i64
+      getter total_response_bytes = 0_i64
+      getter ok_requests = 0_i64
+      getter not_ok_requests = 0_i64
+      getter transport_error_count = 0_i64
+      getter latency = Histogram::Sparse.new
+      getter corrected_latency = Histogram::Sparse.new
+      getter send_delay = Histogram::Sparse.new
+      getter ttfb = Histogram::Sparse.new
+      getter dns = Histogram::Sparse.new
+      getter connect = Histogram::Sparse.new
+      getter tls = Histogram::Sparse.new
+      getter status_latency = Hash(Int32, Histogram::Sparse).new
+      getter error_counts = Hash(String, Int64).new(0_i64)
+      getter error_messages = Hash(String, String).new
+      getter url_stats = Hash(Int32, UrlBatch).new
 
-      getter :total_request_count
-      getter :response_count
-      getter :total_response_bytes
-      getter :ok_requests
-      getter :not_ok_requests
-      getter :transport_error_count
-      getter :total_request_time_ms
-      getter :min_request_time_ms
-      getter :max_request_time_ms
-      getter :mean_latency_ms
-      getter :m2_latency_ms
-      getter :latency_buckets
-      getter :status_code_counts
-      getter :error_counts
-
-      def initialize(@success_status_ranges : Array(Range(Int32, Int32)) = [200..299])
-        @total_request_count = 0_i64
-        @response_count = 0_i64
-        @total_response_bytes = 0_i64
-        @ok_requests = 0_i64
-        @not_ok_requests = 0_i64
-        @transport_error_count = 0_i64
-        @total_request_time_ms = 0.0
-        @min_request_time_ms = Float64::INFINITY
-        @max_request_time_ms = 0.0
-        @mean_latency_ms = 0.0
-        @m2_latency_ms = 0.0
-        @latency_buckets = Hash(Int32, Int64).new(0_i64)
-        @status_code_counts = Hash(Int32, Int64).new(0_i64)
-        @error_counts = Hash(String, Int64).new(0_i64)
+      def initialize(@success_status_ranges : Array(Range(Int32, Int32)) = [200..299], @track_urls : Bool = false)
       end
 
-      def empty?
+      def empty? : Bool
         @total_request_count == 0
       end
 
-      def record_response(time_taken_ms : Float64, status_code : Int32, response_bytes : Int64 = 0_i64)
+      def record(sample : Sample) : Nil
         @total_request_count += 1
         @response_count += 1
-        @total_response_bytes += response_bytes
-        @status_code_counts[status_code] += 1
-        if success_status?(status_code)
+        @total_response_bytes += sample.response_bytes
+
+        success = success_status?(sample.status_code)
+        if success
           @ok_requests += 1
         else
           @not_ok_requests += 1
         end
-        update_latency_metrics time_taken_ms
+
+        @latency.record sample.total_ms
+        @corrected_latency.record sample.corrected_ms
+        @send_delay.record sample.send_delay_ms
+        @ttfb.record sample.ttfb_ms
+        sample.dns_ms.try { |value| @dns.record value }
+        sample.connect_ms.try { |value| @connect.record value }
+        sample.tls_ms.try { |value| @tls.record value }
+
+        status_histogram(sample.status_code).record sample.total_ms
+
+        if @track_urls
+          url = url_batch(sample.url_index)
+          url.requests += 1
+          url.responses += 1
+          success ? (url.ok += 1) : (url.failed += 1)
+          # Per-URL latency follows --latency-correction so per-endpoint gates
+          # see the same outages the global ones do.
+          url.latency.record latency_correction? ? sample.corrected_ms : sample.total_ms
+        end
       end
 
       # Transport errors are excluded from latency metrics: connect failures
       # (~0 ms) and timeouts would otherwise skew the percentiles.
-      def record_error(category : String)
+      def record_error(url_index : Int32, category : String, message : String?) : Nil
         @total_request_count += 1
         @transport_error_count += 1
         @error_counts[category] += 1
+        if message && !@error_messages.has_key?(category)
+          @error_messages[category] = message.byte_slice(0, {message.bytesize, 200}.min)
+        end
+
+        if @track_urls
+          url = url_batch(url_index)
+          url.requests += 1
+          url.transport_errors += 1
+        end
       end
 
-      private def update_latency_metrics(time_taken_ms : Float64)
-        @total_request_time_ms += time_taken_ms
-        @min_request_time_ms = {@min_request_time_ms, time_taken_ms}.min
-        @max_request_time_ms = {@max_request_time_ms, time_taken_ms}.max
+      # Set once by the load generator; the batch needs it to pick which latency
+      # feeds the per-URL histogram.
+      property? latency_correction : Bool = true
 
-        delta = time_taken_ms - @mean_latency_ms
-        @mean_latency_ms += delta / @response_count
-        delta2 = time_taken_ms - @mean_latency_ms
-        @m2_latency_ms += delta * delta2
-
-        @latency_buckets[Stats.histogram_bucket_index(time_taken_ms)] += 1
+      private def status_histogram(status_code : Int32) : Histogram::Sparse
+        @status_latency[status_code] ||= Histogram::Sparse.new
       end
 
-      private def success_status?(status_code : Int32)
+      private def url_batch(url_index : Int32) : UrlBatch
+        @url_stats[url_index] ||= UrlBatch.new
+      end
+
+      private def success_status?(status_code : Int32) : Bool
         @success_status_ranges.any?(&.includes?(status_code))
       end
     end
 
-    @total_request_count : Int64
-    @response_count : Int64
-    @total_response_bytes : Int64
-    @ok_requests : Int64
-    @not_ok_requests : Int64
-    @transport_error_count : Int64
-    @total_request_time_ms : Float64
-    @min_request_time_ms : Float64
-    @max_request_time_ms : Float64
-    @mean_latency_ms : Float64
-    @m2_latency_ms : Float64
-    @latency_histogram : Array(Int64)
-    @status_code_counts : Hash(Int32, Int64)
-    @error_counts : Hash(String, Int64)
-    @mutex : Mutex
     @benchmark_end : Time::Instant?
 
-    getter :request_number
-    getter :duration_mode
-    getter :benchmark_start
-    getter :url
-    getter :output_format
-    getter :success_status_ranges
-    getter :ci_thresholds
-    getter :progress_enabled
-
-    TIME_IN_MILISECONDS = 1000
+    getter request_number : Int32
+    getter? duration_mode : Bool
+    getter benchmark_start : Time::Instant
+    getter url : String
+    getter urls : Array(URI)
+    getter output_format : String
+    getter success_status_ranges : Array(Range(Int32, Int32))
+    getter ci_thresholds : CiThresholds
+    getter config : RunConfig
+    getter? progress_enabled : Bool
+    getter? track_urls : Bool
 
     def initialize(
       @request_number : Int32,
@@ -151,6 +215,8 @@ module Cryload
       @success_status_ranges : Array(Range(Int32, Int32)) = [200..299],
       @ci_thresholds : CiThresholds = CiThresholds.new,
       @progress_enabled : Bool = false,
+      @config : RunConfig = RunConfig.new,
+      @urls : Array(URI) = [] of URI,
     )
       @total_request_count = 0_i64
       @response_count = 0_i64
@@ -158,324 +224,520 @@ module Cryload
       @ok_requests = 0_i64
       @not_ok_requests = 0_i64
       @transport_error_count = 0_i64
-      @total_request_time_ms = 0.0
-      @min_request_time_ms = Float64::INFINITY
-      @max_request_time_ms = 0.0
-      @mean_latency_ms = 0.0
-      @m2_latency_ms = 0.0
-      @latency_histogram = Array(Int64).new(HISTOGRAM_BUCKET_COUNT, 0_i64)
-      @status_code_counts = Hash(Int32, Int64).new(0_i64)
+      @latency = Histogram::Dense.new
+      @corrected_latency = Histogram::Dense.new
+      @send_delay = Histogram::Dense.new
+      @ttfb = Histogram::Dense.new
+      @dns = Histogram::Dense.new
+      @connect = Histogram::Dense.new
+      @tls = Histogram::Dense.new
+      @status_latency = Hash(Int32, Histogram::Dense).new
       @error_counts = Hash(String, Int64).new(0_i64)
+      @error_messages = Hash(String, String).new
+      @url_stats = Hash(Int32, UrlStats).new
       @mutex = Mutex.new
+      @benchmark_end = nil
+      # Per-URL detail is worth collecting for a multi-URL run, and for a
+      # single-URL run only when a per-endpoint gate needs it.
+      @track_urls = @urls.size <= PER_URL_LIMIT && (@urls.size > 1 || @ci_thresholds.scoped?)
     end
 
-    def min_request_time
-      @mutex.synchronize do
-        return 0.0 if @response_count == 0
-        @min_request_time_ms
+    def new_batch : Batch
+      batch = Batch.new(@success_status_ranges, @track_urls)
+      batch.latency_correction = @config.latency_correction?
+      batch
+    end
+
+    def merge_batch(batch : Batch) : Nil
+      return if batch.empty?
+
+      @mutex.synchronize { merge_batch_without_lock batch }
+    end
+
+    def record(sample : Sample) : Nil
+      batch = new_batch
+      batch.record sample
+      merge_batch batch
+    end
+
+    def record_error(category : String, message : String? = nil, url_index : Int32 = 0) : Nil
+      batch = new_batch
+      batch.record_error url_index, category, message
+      merge_batch batch
+    end
+
+    private def merge_batch_without_lock(batch : Batch) : Nil
+      @total_request_count += batch.total_request_count
+      @response_count += batch.response_count
+      @total_response_bytes += batch.total_response_bytes
+      @ok_requests += batch.ok_requests
+      @not_ok_requests += batch.not_ok_requests
+      @transport_error_count += batch.transport_error_count
+
+      @latency.merge batch.latency
+      @corrected_latency.merge batch.corrected_latency
+      @send_delay.merge batch.send_delay
+      @ttfb.merge batch.ttfb
+      @dns.merge batch.dns
+      @connect.merge batch.connect
+      @tls.merge batch.tls
+
+      batch.status_latency.each do |status_code, histogram|
+        (@status_latency[status_code] ||= Histogram::Dense.new).merge histogram
+      end
+
+      batch.error_counts.each do |category, count|
+        @error_counts[category] += count
+      end
+      batch.error_messages.each do |category, message|
+        @error_messages[category] ||= message
+      end
+
+      batch.url_stats.each do |url_index, url_batch|
+        (@url_stats[url_index] ||= UrlStats.new).merge url_batch
       end
     end
 
-    def max_request_time
-      @mutex.synchronize do
-        return 0.0 if @response_count == 0
-        @max_request_time_ms
-      end
+    # Timing window ------------------------------------------------------------
+
+    # Warmup runs before the timed window; v5 started the clock before warmup,
+    # which deflated throughput and shortened the duration window by the warmup
+    # length.
+    def start_benchmark_window : Nil
+      @mutex.synchronize { @benchmark_start = Time.instant }
     end
 
-    def average_request_time
-      @mutex.synchronize do
-        return 0.0 if @response_count == 0
-        @total_request_time_ms / @response_count
-      end
+    def mark_benchmark_end(at : Time::Instant = Time.instant) : Nil
+      @mutex.synchronize { @benchmark_end ||= at }
     end
 
-    def latency_stdev
-      @mutex.synchronize do
-        return 0.0 if @response_count < 2
-        variance = @m2_latency_ms / @response_count
-        Math.sqrt(variance)
-      end
-    end
-
-    # Requests per second = total requests / wall clock time (actual throughput)
-    def request_per_second
-      count = total_request_count
-      return 0.0 if count == 0
-      elapsed = wall_clock_seconds
-      elapsed > 0 ? count.to_f / elapsed : 0.0
-    end
-
-    # Wall clock time from benchmark start to report completion.
-    def wall_clock_seconds
+    def wall_clock_seconds : Float64
       @mutex.synchronize do
         end_at = @benchmark_end || Time.instant
         (end_at - @benchmark_start).total_seconds
       end
     end
 
-    def mark_benchmark_end
-      @mutex.synchronize do
-        @benchmark_end ||= Time.instant
-      end
+    def deadline : Time::Instant?
+      @config.duration.try { |span| benchmark_start + span }
     end
 
-    def total_request_time_in_seconds
-      total_request_time / TIME_IN_MILISECONDS
-    end
+    # Counters ----------------------------------------------------------------
 
-    def ok_requests
-      @mutex.synchronize { @ok_requests }
-    end
-
-    def not_ok_requests
-      @mutex.synchronize { @not_ok_requests }
-    end
-
-    def empty?
-      @mutex.synchronize { @total_request_count == 0 }
-    end
-
-    def total_request_count
+    def total_request_count : Int64
       @mutex.synchronize { @total_request_count }
     end
 
-    def total_response_bytes
-      @mutex.synchronize { @total_response_bytes }
-    end
-
-    def average_bytes_per_response
-      @mutex.synchronize do
-        return 0.0 if @response_count == 0
-        @total_response_bytes.to_f / @response_count
-      end
-    end
-
-    def bytes_per_second
-      bytes = total_response_bytes
-      return 0.0 if bytes == 0
-      elapsed = wall_clock_seconds
-      elapsed > 0 ? bytes.to_f / elapsed : 0.0
-    end
-
-    def p95_request_time
-      percentile_request_time(95.0)
-    end
-
-    def p99_request_time
-      percentile_request_time(99.0)
-    end
-
-    def p50_request_time
-      percentile_request_time(50.0)
-    end
-
-    def p25_request_time
-      percentile_request_time(25.0)
-    end
-
-    def p90_request_time
-      percentile_request_time(90.0)
-    end
-
-    def p75_request_time
-      percentile_request_time(75.0)
-    end
-
-    def p999_request_time
-      percentile_request_time(99.9)
-    end
-
-    def p10_request_time
-      percentile_request_time(10.0)
-    end
-
-    def response_count
+    def response_count : Int64
       @mutex.synchronize { @response_count }
     end
 
-    def transport_error_count
+    def transport_error_count : Int64
       @mutex.synchronize { @transport_error_count }
     end
 
-    def status_code_counts
-      @mutex.synchronize { @status_code_counts.dup }
+    def ok_requests : Int64
+      @mutex.synchronize { @ok_requests }
     end
 
-    def error_counts
-      @mutex.synchronize { @error_counts.dup }
+    def not_ok_requests : Int64
+      @mutex.synchronize { @not_ok_requests }
     end
 
-    def latency_histogram_bins(bin_count : Int32 = 11)
+    def total_response_bytes : Int64
+      @mutex.synchronize { @total_response_bytes }
+    end
+
+    def empty? : Bool
+      total_request_count == 0
+    end
+
+    def request_per_second : Float64
+      count = total_request_count
+      return 0.0 if count == 0
+      elapsed = wall_clock_seconds
+      elapsed > 0 ? count / elapsed : 0.0
+    end
+
+    def bytes_per_second : Float64
+      bytes = total_response_bytes
+      return 0.0 if bytes == 0
+      elapsed = wall_clock_seconds
+      elapsed > 0 ? bytes / elapsed : 0.0
+    end
+
+    def average_bytes_per_response : Float64
       @mutex.synchronize do
-        return [] of NamedTuple(start_ms: Float64, end_ms: Float64, count: Int64, percent: Float64) if @response_count == 0
-
-        if Stats.histogram_bucket_index(@min_request_time_ms) == Stats.histogram_bucket_index(@max_request_time_ms)
-          return [{
-            start_ms: @min_request_time_ms.round(2),
-            end_ms:   @max_request_time_ms.round(2),
-            count:    @response_count,
-            percent:  100.0,
-          }]
-        end
-
-        effective_bin_count = {1, bin_count}.max
-        span_ms = @max_request_time_ms - @min_request_time_ms
-        counts = Array(Int64).new(effective_bin_count, 0_i64)
-
-        @latency_histogram.each_with_index do |count, index|
-          next if count == 0
-
-          latency_ms = Stats.histogram_bucket_value(index)
-          bin_index = (((latency_ms - @min_request_time_ms) / span_ms) * effective_bin_count).floor.to_i
-          bin_index = 0 if bin_index < 0
-          bin_index = effective_bin_count - 1 if bin_index >= effective_bin_count
-          counts[bin_index] += count
-        end
-
-        bins = [] of NamedTuple(start_ms: Float64, end_ms: Float64, count: Int64, percent: Float64)
-        effective_bin_count.times do |index|
-          start_ms = @min_request_time_ms + (span_ms * index / effective_bin_count)
-          end_ms = if index == effective_bin_count - 1
-                     @max_request_time_ms
-                   else
-                     @min_request_time_ms + (span_ms * (index + 1) / effective_bin_count)
-                   end
-          bins << {
-            start_ms: start_ms.round(2),
-            end_ms:   end_ms.round(2),
-            count:    counts[index],
-            percent:  ((counts[index].to_f / @response_count) * 100.0).round(2),
-          }
-        end
-
-        bins
+        @response_count == 0 ? 0.0 : @total_response_bytes.to_f / @response_count
       end
     end
 
-    def final_exit_code
-      @mutex.synchronize { ci_threshold_failed_unlocked? ? 1 : 0 }
-    end
-
-    def failure_rate_percent
+    def failure_rate_percent : Float64
       @mutex.synchronize { failure_rate_percent_unlocked }
     end
 
-    def json_output
-      @output_format == "json"
-    end
+    # Latency views -----------------------------------------------------------
 
-    def csv_output
-      @output_format == "csv"
-    end
+    # Snapshot of one histogram taken under the lock, so the report never mixes
+    # values from different instants.
+    struct LatencyView
+      getter count : Int64
+      getter avg : Float64
+      getter min : Float64
+      getter max : Float64
+      getter stdev : Float64
+      getter percentiles : Hash(Float64, Float64)
 
-    def quiet_output
-      @output_format == "quiet"
-    end
+      def initialize(@count, @avg, @min, @max, @stdev, @percentiles)
+      end
 
-    def text_output?
-      @output_format == "text"
-    end
+      def p(value : Float64) : Float64
+        @percentiles[value]
+      end
 
-    def <<(request : Request)
-      record_response request.time_taken, request.status_code, request.response_bytes
-    end
-
-    def record_response(time_taken_ms : Float64, status_code : Int32, response_bytes : Int64 = 0_i64)
-      batch = Batch.new(@success_status_ranges)
-      batch.record_response time_taken_ms, status_code, response_bytes
-      merge_batch batch
-    end
-
-    def record_error(category : String)
-      batch = Batch.new(@success_status_ranges)
-      batch.record_error category
-      merge_batch batch
-    end
-
-    def merge_batch(batch : Batch)
-      return if batch.empty?
-
-      @mutex.synchronize do
-        merge_batch_without_lock batch
+      def empty? : Bool
+        @count == 0
       end
     end
 
-    private def total_request_time
-      @mutex.synchronize { @total_request_time_ms }
+    REPORT_PERCENTILES = [10.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0, 99.9]
+    PHASE_PERCENTILES  = [50.0, 90.0, 95.0, 99.0, 99.9]
+
+    def latency_view : LatencyView
+      @mutex.synchronize { view_of @latency, REPORT_PERCENTILES }
     end
 
-    private def merge_batch_without_lock(batch : Batch)
-      previous_responses = @response_count
-      batch_responses = batch.response_count
+    def corrected_latency_view : LatencyView
+      @mutex.synchronize { view_of @corrected_latency, REPORT_PERCENTILES }
+    end
 
-      @total_request_count += batch.total_request_count
-      @response_count += batch_responses
-      @total_response_bytes += batch.total_response_bytes
-      @ok_requests += batch.ok_requests
-      @not_ok_requests += batch.not_ok_requests
-      @transport_error_count += batch.transport_error_count
-      @total_request_time_ms += batch.total_request_time_ms
-      @min_request_time_ms = @min_request_time_ms.finite? ? {@min_request_time_ms, batch.min_request_time_ms}.min : batch.min_request_time_ms
-      @max_request_time_ms = {@max_request_time_ms, batch.max_request_time_ms}.max
+    def send_delay_view : LatencyView
+      @mutex.synchronize { view_of @send_delay, PHASE_PERCENTILES }
+    end
 
-      if batch_responses > 0
-        if previous_responses == 0
-          @mean_latency_ms = batch.mean_latency_ms
-          @m2_latency_ms = batch.m2_latency_ms
-        else
-          combined_responses = @response_count
-          delta = batch.mean_latency_ms - @mean_latency_ms
-          @mean_latency_ms += delta * batch_responses / combined_responses
-          @m2_latency_ms += batch.m2_latency_ms + delta * delta * previous_responses * batch_responses / combined_responses
+    # The histogram the CI gates read: corrected unless the user turned
+    # correction off. Identical to the service histogram without --rate.
+    def effective_latency_view : LatencyView
+      @config.latency_correction? ? corrected_latency_view : latency_view
+    end
+
+    def phase_views : Hash(String, LatencyView)
+      @mutex.synchronize do
+        {
+          "dns"     => view_of(@dns, PHASE_PERCENTILES),
+          "connect" => view_of(@connect, PHASE_PERCENTILES),
+          "tls"     => view_of(@tls, PHASE_PERCENTILES),
+          "ttfb"    => view_of(@ttfb, PHASE_PERCENTILES),
+          "total"   => view_of(@latency, PHASE_PERCENTILES),
+        }
+      end
+    end
+
+    def latency_histogram_bins(bin_count : Int32 = 11)
+      @mutex.synchronize { @latency.linear_bins bin_count }
+    end
+
+    private def view_of(histogram : Histogram::Dense, percentiles : Array(Float64)) : LatencyView
+      values = Hash(Float64, Float64).new
+      percentiles.each { |percentile| values[percentile] = histogram.percentile(percentile) }
+      LatencyView.new(
+        histogram.count,
+        histogram.avg,
+        histogram.minimum,
+        histogram.maximum,
+        histogram.stdev,
+        values,
+      )
+    end
+
+    # Breakdowns --------------------------------------------------------------
+
+    struct StatusEntry
+      getter code : Int32
+      getter count : Int64
+      getter percent : Float64
+      getter avg_ms : Float64
+      getter p50_ms : Float64
+      getter p95_ms : Float64
+      getter p99_ms : Float64
+
+      def initialize(@code, @count, @percent, @avg_ms, @p50_ms, @p95_ms, @p99_ms)
+      end
+    end
+
+    struct ErrorEntry
+      getter category : String
+      getter count : Int64
+      getter percent : Float64
+      getter sample_message : String?
+
+      def initialize(@category, @count, @percent, @sample_message)
+      end
+    end
+
+    struct UrlEntry
+      getter url : String
+      getter requests : Int64
+      getter responses : Int64
+      getter transport_errors : Int64
+      getter ok : Int64
+      getter failed : Int64
+      getter failure_rate_percent : Float64
+      getter requests_per_second : Float64
+      getter avg_ms : Float64
+      getter min_ms : Float64
+      getter max_ms : Float64
+      getter p50_ms : Float64
+      getter p75_ms : Float64
+      getter p90_ms : Float64
+      getter p95_ms : Float64
+      getter p99_ms : Float64
+      getter p999_ms : Float64
+
+      def initialize(
+        @url, @requests, @responses, @transport_errors, @ok, @failed,
+        @failure_rate_percent, @requests_per_second, @avg_ms, @min_ms, @max_ms,
+        @p50_ms, @p75_ms, @p90_ms, @p95_ms, @p99_ms, @p999_ms,
+      )
+      end
+    end
+
+    def status_breakdown : Array(StatusEntry)
+      @mutex.synchronize do
+        @status_latency.map do |status_code, histogram|
+          StatusEntry.new(
+            status_code,
+            histogram.count,
+            percent_of(histogram.count, @response_count),
+            histogram.avg.round(2),
+            histogram.percentile(50.0).round(2),
+            histogram.percentile(95.0).round(2),
+            histogram.percentile(99.0).round(2),
+          )
+        end.sort_by! { |entry| {-entry.count, entry.code} }
+      end
+    end
+
+    def status_code_counts : Hash(Int32, Int64)
+      @mutex.synchronize do
+        counts = Hash(Int32, Int64).new(0_i64)
+        @status_latency.each { |status_code, histogram| counts[status_code] = histogram.count }
+        counts
+      end
+    end
+
+    def error_breakdown : Array(ErrorEntry)
+      @mutex.synchronize do
+        total = @transport_error_count
+        @error_counts.map do |category, count|
+          ErrorEntry.new(category, count, percent_of(count, total), @error_messages[category]?)
+        end.sort_by! { |entry| {-entry.count, entry.category} }
+      end
+    end
+
+    def url_breakdown : Array(UrlEntry)?
+      return unless @track_urls
+
+      elapsed = wall_clock_seconds
+      @mutex.synchronize do
+        @url_stats.keys.sort!.map do |url_index|
+          stats = @url_stats[url_index]
+          latency = stats.latency
+          UrlEntry.new(
+            @urls[url_index]?.try(&.to_s) || @url,
+            stats.requests,
+            stats.responses,
+            stats.transport_errors,
+            stats.ok,
+            stats.failed,
+            stats.failure_rate_percent.round(2),
+            (elapsed > 0 ? stats.requests / elapsed : 0.0).round(2),
+            latency.avg.round(2),
+            latency.minimum.round(2),
+            latency.maximum.round(2),
+            latency.percentile(50.0).round(2),
+            latency.percentile(75.0).round(2),
+            latency.percentile(90.0).round(2),
+            latency.percentile(95.0).round(2),
+            latency.percentile(99.0).round(2),
+            latency.percentile(99.9).round(2),
+          )
+        end
+      end
+    end
+
+    # Rate attainment ---------------------------------------------------------
+
+    struct RateReport
+      getter requested : Float64?
+      getter attained : Float64
+      getter attainment_percent : Float64?
+      getter scheduled_requests : Int64?
+      getter skipped_requests : Int64?
+      getter schedule_drift_ms : Float64?
+
+      def initialize(@requested, @attained, @attainment_percent, @scheduled_requests, @skipped_requests, @schedule_drift_ms)
+      end
+
+      def limited? : Bool
+        !@requested.nil?
+      end
+
+      def missed?(tolerance : Float64) : Bool
+        percent = @attainment_percent
+        return false unless percent
+        percent < tolerance
+      end
+    end
+
+    def rate_report : RateReport
+      attained = request_per_second
+      requested = @config.rate_limit
+      return RateReport.new(nil, attained, nil, nil, nil, nil) unless requested
+
+      scheduled = scheduled_request_count(requested)
+      issued = total_request_count
+      skipped = scheduled ? {scheduled - issued, 0_i64}.max : nil
+      drift = @mutex.synchronize { @send_delay.maximum }
+
+      RateReport.new(
+        requested,
+        attained,
+        ((attained / requested) * 100.0),
+        scheduled,
+        skipped,
+        drift,
+      )
+    end
+
+    # In duration mode the schedule is defined by the window; in request-count
+    # mode the target itself is the schedule.
+    private def scheduled_request_count(requested : Float64) : Int64?
+      if duration = @config.duration
+        RateLimiter.scheduled_count(requested, duration)
+      elsif @request_number > 0
+        @request_number.to_i64
+      end
+    end
+
+    # Verdict -----------------------------------------------------------------
+
+    def threshold_results : Array(ThresholdResult)
+      results = [] of ThresholdResult
+      latency = effective_latency_view
+      metric_prefix = @config.latency_correction? ? "corrected_" : ""
+
+      @ci_thresholds.global.each do |threshold|
+        actual = global_metric_value threshold.metric, latency
+        results << build_result(threshold, "global", actual, metric_prefix)
+      end
+
+      scoped = @ci_thresholds.scoped
+      unless scoped.empty?
+        breakdown = url_breakdown
+        scoped.each do |threshold|
+          scope = threshold.scope.to_s
+          actual = 0.0
+          if breakdown
+            matching = breakdown.select(&.url.includes?(scope))
+            # Worst value across every URL matching the pattern, so one slow
+            # endpoint cannot hide behind a fast sibling.
+            actual = aggregate_url_metric(threshold, matching) unless matching.empty?
+          end
+          results << build_result(threshold, scope, actual, metric_prefix)
         end
       end
 
-      batch.latency_buckets.each do |bucket_index, count|
-        @latency_histogram[bucket_index] += count
+      results
+    end
+
+    private def build_result(threshold : Threshold, scope : String, actual : Float64, metric_prefix : String) : ThresholdResult
+      metric = threshold.metric.latency? ? "#{metric_prefix}#{threshold.metric.label}" : threshold.metric.label
+      ThresholdResult.new(
+        threshold.name,
+        scope,
+        metric,
+        threshold.comparator.symbol,
+        threshold.limit,
+        actual.round(2),
+        threshold.comparator.satisfied?(actual, threshold.limit),
+      )
+    end
+
+    private def global_metric_value(metric : Threshold::Metric, latency : LatencyView) : Float64
+      if percentile = metric.percentile
+        return latency.p(percentile)
       end
 
-      batch.status_code_counts.each do |status_code, count|
-        @status_code_counts[status_code] += count
-      end
-      batch.error_counts.each do |category, count|
-        @error_counts[category] += count
+      case metric
+      when .avg?         then latency.avg
+      when .max_latency? then latency.max
+      when .fail_rate?   then failure_rate_percent
+      when .rps?         then request_per_second
+      else                    0.0
       end
     end
 
-    private def ci_threshold_failed_unlocked? : Bool
-      return true if transport_only_failure_unlocked?
-      return true if fail_on_transport_error_threshold_unlocked?
-      return true if fail_on_error_threshold_unlocked?
-      return true if max_fail_rate_threshold_unlocked?
-      return true if max_p99_threshold_unlocked?
+    # Worst value across every URL matching the pattern, evaluated on the same
+    # latency the global gates use (see Batch#record).
+    private def aggregate_url_metric(threshold : Threshold, entries : Array(UrlEntry)) : Float64
+      values = entries.map do |entry|
+        case threshold.metric
+        in .p50?         then entry.p50_ms
+        in .p75?         then entry.p75_ms
+        in .p90?         then entry.p90_ms
+        in .p95?         then entry.p95_ms
+        in .p99?         then entry.p99_ms
+        in .p999?        then entry.p999_ms
+        in .avg?         then entry.avg_ms
+        in .max_latency? then entry.max_ms
+        in .fail_rate?   then entry.failure_rate_percent
+        in .rps?         then entry.requests_per_second
+        end
+      end
+
+      threshold.comparator.at_most? ? values.max : values.min
+    end
+
+    def breached_thresholds : Array(ThresholdResult)
+      threshold_results.reject(&.passed?)
+    end
+
+    def exit_code : ExitCode
+      return ExitCode::TargetUnreachable if target_unreachable?
+      return ExitCode::ThresholdBreach if failure_flags_breached? || !breached_thresholds.empty?
+      ExitCode::Ok
+    end
+
+    def target_unreachable? : Bool
+      @mutex.synchronize { @response_count == 0 && @transport_error_count > 0 }
+    end
+
+    def failure_flags_breached? : Bool
+      return true if @ci_thresholds.fail_on_transport_error? && transport_error_count > 0
+      return true if @ci_thresholds.fail_on_error? && (not_ok_requests > 0 || transport_error_count > 0)
+      if @ci_thresholds.fail_on_rate_miss?
+        return true if rate_report.missed?(CiThresholds::RATE_ATTAINMENT_TOLERANCE)
+      end
       false
     end
 
-    private def transport_only_failure_unlocked? : Bool
-      @transport_error_count > 0 && @response_count == 0
+    # Output format helpers ---------------------------------------------------
+
+    def json_output? : Bool
+      @output_format == "json"
     end
 
-    private def fail_on_transport_error_threshold_unlocked? : Bool
-      @ci_thresholds.fail_on_transport_error? && @transport_error_count > 0
+    def csv_output? : Bool
+      @output_format == "csv"
     end
 
-    private def fail_on_error_threshold_unlocked? : Bool
-      @ci_thresholds.fail_on_error? && (@not_ok_requests > 0 || @transport_error_count > 0)
+    def quiet_output? : Bool
+      @output_format == "quiet"
     end
 
-    private def max_fail_rate_threshold_unlocked? : Bool
-      if max_rate = @ci_thresholds.max_fail_rate
-        return @total_request_count > 0 && failure_rate_percent_unlocked > max_rate
-      end
-      false
-    end
-
-    private def max_p99_threshold_unlocked? : Bool
-      if max_p99 = @ci_thresholds.max_p99_ms
-        return @total_request_count > 0 && percentile_request_time_unlocked(99.0) > max_p99
-      end
-      false
+    def text_output? : Bool
+      @output_format == "text"
     end
 
     private def failure_rate_percent_unlocked : Float64
@@ -483,26 +745,9 @@ module Cryload
       ((@not_ok_requests + @transport_error_count).to_f / @total_request_count) * 100.0
     end
 
-    private def percentile_request_time_unlocked(percentile : Float64) : Float64
-      return 0.0 if @response_count == 0
-
-      rank = (@response_count.to_f * (percentile / 100.0)).ceil.to_i64
-      rank = 1_i64 if rank < 1
-      seen = 0_i64
-
-      @latency_histogram.each_with_index do |count, index|
-        next if count == 0
-        seen += count
-        if seen >= rank
-          return Stats.histogram_bucket_value(index).clamp(@min_request_time_ms, @max_request_time_ms)
-        end
-      end
-
-      @max_request_time_ms
-    end
-
-    private def percentile_request_time(percentile : Float64)
-      @mutex.synchronize { percentile_request_time_unlocked(percentile) }
+    private def percent_of(count : Int64, total : Int64) : Float64
+      return 0.0 if total == 0
+      ((count.to_f / total) * 100.0).round(2)
     end
   end
 
@@ -515,13 +760,24 @@ module Cryload
     success_status_ranges : Array(Range(Int32, Int32)) = [200..299],
     ci_thresholds : CiThresholds = CiThresholds.new,
     progress_enabled : Bool = false,
+    config : RunConfig = RunConfig.new,
+    urls : Array(URI) = [] of URI,
   )
-    @@stats = Stats.new request_number, duration_mode, benchmark_start, url, output_format, success_status_ranges, ci_thresholds, progress_enabled
+    @@stats = Stats.new(
+      request_number, duration_mode, benchmark_start, url, output_format,
+      success_status_ranges, ci_thresholds, progress_enabled, config, urls
+    )
   end
 
-  def self.stats
+  def self.stats : Stats
     stats = @@stats
     raise "Stats not initialized" unless stats
     stats
+  end
+
+  # Nil until the run is configured, so the signal handler can fire before the
+  # load generator exists without blowing up.
+  def self.stats? : Stats?
+    @@stats
   end
 end

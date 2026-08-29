@@ -6,12 +6,26 @@ module Cryload
       VALID_METHODS        = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
       VALID_OUTPUT_FORMATS = {"text", "json", "csv", "quiet"}
 
+      URL_THRESHOLD_METRICS = {
+        "max-p50"       => Threshold::Metric::P50,
+        "max-p75"       => Threshold::Metric::P75,
+        "max-p90"       => Threshold::Metric::P90,
+        "max-p95"       => Threshold::Metric::P95,
+        "max-p99"       => Threshold::Metric::P99,
+        "max-p999"      => Threshold::Metric::P999,
+        "max-avg"       => Threshold::Metric::Avg,
+        "max-latency"   => Threshold::Metric::MaxLatency,
+        "max-fail-rate" => Threshold::Metric::FailRate,
+        "min-rps"       => Threshold::Metric::Rps,
+      }
+
       def validate(options : Options, &on_ready : String ->)
         return false unless validate_url_sources(options)
         return false unless validate_request_settings(options)
         return false unless validate_output_settings(options)
         return false unless validate_threshold_settings(options)
         return false unless validate_proxy_and_cookies(options)
+        return false unless validate_fd_limit(options)
         validate_run_mode(options, on_ready)
       end
 
@@ -52,6 +66,13 @@ module Cryload
           return false
         end
 
+        if workers = options.workers
+          if workers <= 0
+            error "Workers must be greater than 0."
+            return false
+          end
+        end
+
         unless VALID_METHODS.includes?(options.method)
           error "Invalid HTTP method '#{options.method}'. Allowed: #{VALID_METHODS.join(", ")}"
           return false
@@ -67,7 +88,7 @@ module Cryload
         return false unless validate_disable_keepalive(options)
         return false unless validate_body_sources(options)
         return false unless validate_basic_auth(options)
-        return false unless validate_timeout(options)
+        return false unless validate_timeouts(options)
 
         true
       end
@@ -152,10 +173,22 @@ module Cryload
         true
       end
 
-      private def validate_timeout(options) : Bool
+      private def validate_timeouts(options) : Bool
         if timeout = options.timeout
-          if timeout <= 0
-            error "Timeout must be greater than 0 seconds."
+          unless timeout.positive?
+            error "Timeout must be greater than 0."
+            return false
+          end
+        end
+
+        if request_timeout = options.request_timeout
+          unless request_timeout.positive?
+            error "Request timeout must be greater than 0."
+            return false
+          end
+
+          if (timeout = options.timeout) && request_timeout < timeout
+            error "Request timeout (#{Duration.format(request_timeout)}) must not be shorter than --timeout (#{Duration.format(timeout)})."
             return false
           end
         end
@@ -189,13 +222,43 @@ module Cryload
       end
 
       private def validate_threshold_settings(options) : Bool
+        return false unless validate_rate_settings(options)
+        return false unless validate_latency_limits(options)
+
+        if warmup = options.warmup
+          if warmup.negative?
+            error "Warmup must be 0 or greater."
+            return false
+          end
+        end
+
+        validate_url_thresholds(options)
+      end
+
+      private def validate_rate_settings(options) : Bool
         if rate = options.rate
-          if rate <= 0
+          if rate <= 0.0
             error "Rate must be greater than 0 requests/sec."
             return false
           end
         end
 
+        if options.fail_on_rate_miss? && options.rate.nil?
+          error "'--fail-on-rate-miss' needs a requested rate; add '-q/--rate'."
+          return false
+        end
+
+        if min_rps = options.min_rps
+          if min_rps <= 0.0
+            error "'--min-rps' must be greater than 0 requests/sec."
+            return false
+          end
+        end
+
+        true
+      end
+
+      private def validate_latency_limits(options) : Bool
         if max_fail_rate = options.max_fail_rate
           if max_fail_rate < 0.0 || max_fail_rate > 100.0
             error "Max fail rate must be between 0 and 100."
@@ -203,18 +266,44 @@ module Cryload
           end
         end
 
-        if max_p99_ms = options.max_p99_ms
-          if max_p99_ms <= 0.0
-            error "Max p99 latency must be greater than 0 milliseconds."
+        options.max_latency.each do |metric, limit|
+          if limit <= 0.0
+            error "'--#{metric.flag}' must be greater than 0 milliseconds."
             return false
           end
         end
 
-        if warmup = options.warmup
-          if warmup < 0
-            error "Warmup must be 0 or greater."
-            return false
-          end
+        true
+      end
+
+      private def validate_url_thresholds(options) : Bool
+        return true if options.url_thresholds.empty?
+
+        thresholds = begin
+          parse_url_thresholds(options.url_thresholds)
+        rescue ex : ArgumentError
+          error ex.message.to_s
+          return false
+        end
+
+        urls = begin
+          OptionsBuilder.resolve_urls(options)
+        rescue ex : ArgumentError
+          error ex.message.to_s
+          return false
+        end
+
+        if urls.size > Stats::PER_URL_LIMIT
+          error "'--url-threshold' needs the per-URL breakdown, which is disabled above #{Stats::PER_URL_LIMIT} target URLs (#{urls.size} given)."
+          return false
+        end
+
+        rendered = urls.map(&.to_s)
+        thresholds.each do |threshold|
+          pattern = threshold.scope.to_s
+          next if rendered.any?(&.includes?(pattern))
+          error "'--url-threshold' pattern '#{pattern}' matches none of the #{urls.size} target URL(s)."
+          return false
         end
 
         true
@@ -241,6 +330,15 @@ module Cryload
         true
       end
 
+      # Running out of descriptors mid-benchmark shows up as a pile of transport
+      # errors that look like the target failing, so it is worth catching before
+      # the first request.
+      private def validate_fd_limit(options) : Bool
+        return true unless message = FdLimit.ensure(options.connections)
+        error message
+        false
+      end
+
       private def validate_run_mode(options, on_ready : String ->) : Bool
         duration = options.duration
         numbers = options.numbers
@@ -251,11 +349,11 @@ module Cryload
         end
 
         if duration
-          if duration <= 0
+          unless duration.positive?
             error "Duration must be greater than 0."
             return false
           end
-          on_ready.call("Preparing to make it CRY for #{duration} seconds with #{options.connections} connections!")
+          on_ready.call("Preparing to make it CRY for #{Duration.format(duration)} with #{options.connections} connections!")
           true
         elsif numbers
           if numbers <= 0
@@ -265,8 +363,40 @@ module Cryload
           on_ready.call("Preparing to make it CRY for #{numbers} requests with #{options.connections} connections!")
           true
         else
-          error "You have to specify '-n' (number of requests) or '-d' (duration in seconds)"
+          error "You have to specify '-n' (number of requests) or '-d' (duration)"
           false
+        end
+      end
+
+      # `PATTERN METRIC VALUE`, whitespace separated. Colons and equals signs are
+      # avoided as separators because both appear inside URLs.
+      def parse_url_thresholds(raw_values : Array(String)) : Array(Threshold)
+        raw_values.map do |raw|
+          parts = raw.strip.split(/\s+/)
+          unless parts.size == 3
+            raise ArgumentError.new(
+              "Invalid --url-threshold '#{raw}'. Use 'PATTERN METRIC VALUE' (e.g. '/api/users max-p99 120')."
+            )
+          end
+
+          pattern, metric_name, raw_limit = parts
+          metric = URL_THRESHOLD_METRICS[metric_name.downcase]?
+          unless metric
+            raise ArgumentError.new(
+              "Invalid --url-threshold metric '#{metric_name}'. Allowed: #{URL_THRESHOLD_METRICS.keys.join(", ")}"
+            )
+          end
+
+          limit = raw_limit.to_f?
+          unless limit && limit > 0.0
+            raise ArgumentError.new("Invalid --url-threshold value '#{raw_limit}' for #{metric_name}: expected a positive number.")
+          end
+
+          if pattern.empty?
+            raise ArgumentError.new("Invalid --url-threshold '#{raw}': the URL pattern must not be empty.")
+          end
+
+          Threshold.new(metric, limit, pattern)
         end
       end
 

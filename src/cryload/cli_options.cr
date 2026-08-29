@@ -6,8 +6,9 @@ module Cryload
       property server : String?
       property urls_file : String?
       property numbers : Int32?
-      property duration : Int32?
+      property duration : Time::Span?
       property connections : Int32 = 10
+      property workers : Int32?
       property method : String = "GET"
       property body : String?
       property body_file : String?
@@ -17,8 +18,9 @@ module Cryload
       property user_agent : String?
       property host_header : String?
       property basic_auth : String?
-      property timeout : Int32?
-      property rate : Int32?
+      property timeout : Time::Span?
+      property request_timeout : Time::Span?
+      property rate : Float64?
       property? follow_redirects : Bool = false
       property? disable_keepalive : Bool = false
       property output_format : String?
@@ -27,11 +29,17 @@ module Cryload
       property? insecure : Bool = false
       property? fail_on_error : Bool = false
       property? fail_on_transport_error : Bool = false
+      property? fail_on_rate_miss : Bool = false
+      property? latency_correction : Bool = true
       property max_fail_rate : Float64?
-      property max_p99_ms : Float64?
-      property warmup : Int32?
+      property min_rps : Float64?
+      property max_latency : Hash(Threshold::Metric, Float64) = Hash(Threshold::Metric, Float64).new
+      property url_thresholds : Array(String) = [] of String
+      property warmup : Time::Span?
       property proxy : String?
-      property? progress : Bool = true
+      # nil means "decide from the terminal": progress belongs on an interactive
+      # stderr, not in a CI log full of carriage returns.
+      property progress : Bool?
       property? random_path : Bool = false
     end
 
@@ -47,6 +55,12 @@ module Cryload
         return options.body if options.body
         return STDIN.gets_to_end if options.body_stdin?
         options.body_file.try { |path| File.read(path) }
+      end
+
+      def resolve_progress(options : Options) : Bool
+        progress = options.progress
+        return progress unless progress.nil?
+        STDERR.tty?
       end
 
       def build_headers(options : Options) : HTTP::Headers
@@ -68,12 +82,25 @@ module Cryload
         headers
       end
 
+      def build_timeouts(options : Options) : Timeouts
+        Timeouts.new(timeout: options.timeout, request_timeout: options.request_timeout)
+      end
+
       def build_ci_thresholds(options : Options) : CiThresholds
+        thresholds = [] of Threshold
+
+        options.max_latency.each do |metric, limit|
+          thresholds << Threshold.new(metric, limit)
+        end
+        options.max_fail_rate.try { |limit| thresholds << Threshold.new(Threshold::Metric::FailRate, limit) }
+        options.min_rps.try { |limit| thresholds << Threshold.new(Threshold::Metric::Rps, limit) }
+        thresholds.concat Validator.parse_url_thresholds(options.url_thresholds)
+
         CiThresholds.new(
           fail_on_error: options.fail_on_error?,
           fail_on_transport_error: options.fail_on_transport_error?,
-          max_fail_rate: options.max_fail_rate,
-          max_p99_ms: options.max_p99_ms,
+          fail_on_rate_miss: options.fail_on_rate_miss?,
+          thresholds: thresholds,
         )
       end
 

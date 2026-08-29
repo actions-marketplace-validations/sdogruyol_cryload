@@ -27,6 +27,10 @@ module Cryload
   # statically linked libcrypto) does not exist on the user's machine.
   MACOS_SYSTEM_CA_BUNDLE = "/etc/ssl/cert.pem"
 
+  def self.elapsed_ms(since : Time::Instant) : Float64
+    (Time.instant - since).total_milliseconds
+  end
+
   def self.proxy_request_target(uri : URI) : String
     port = effective_port(uri)
     "#{uri.scheme}://#{uri.host}:#{port}#{uri.request_target}"
@@ -36,39 +40,41 @@ module Cryload
     uri.port || (uri.scheme == "https" ? 443 : 80)
   end
 
-  def self.create_http_client(uri, timeout_seconds : Int32? = nil, insecure : Bool = false, proxy : URI? = nil)
-    return create_direct_http_client(uri, timeout_seconds, insecure) unless proxy
+  def self.create_http_client(uri, timeouts : Timeouts = Timeouts.new, insecure : Bool = false, proxy : URI? = nil) : PhasedClient
+    return create_direct_http_client(uri, timeouts, insecure) unless proxy
 
     if uri.scheme == "https"
-      create_https_proxy_client(uri, proxy, timeout_seconds, insecure)
+      create_https_proxy_client(uri, proxy, timeouts, insecure)
     else
-      create_http_proxy_client(uri, proxy, timeout_seconds, insecure)
+      create_http_proxy_client(uri, proxy, timeouts, insecure)
     end
   end
 
-  def self.create_direct_http_client(uri, timeout_seconds : Int32? = nil, insecure : Bool = false)
+  def self.create_direct_http_client(uri, timeouts : Timeouts = Timeouts.new, insecure : Bool = false) : PhasedClient
     host = uri.host || raise ArgumentError.new("URI host is required")
     port = effective_port(uri)
     tls_context = tls_context_for(uri, insecure)
-    client = HTTP::Client.new host, port: port, tls: tls_context
-    apply_timeouts(client, timeout_seconds)
+    client = PhasedClient.new host, port: port, tls: tls_context
+    timeouts.apply(client)
     client
   end
 
-  def self.create_http_proxy_client(uri, proxy : URI, timeout_seconds : Int32? = nil, insecure : Bool = false)
+  def self.create_http_proxy_client(uri, proxy : URI, timeouts : Timeouts = Timeouts.new, insecure : Bool = false) : PhasedClient
     proxy_host = proxy.host || raise ArgumentError.new("Proxy host is required")
     proxy_port = effective_port(proxy)
-    client = HTTP::Client.new proxy_host, port: proxy_port, tls: tls_context_for(proxy, insecure)
-    apply_timeouts(client, timeout_seconds)
+    client = PhasedClient.new proxy_host, port: proxy_port, tls: tls_context_for(proxy, insecure)
+    timeouts.apply(client)
     client
   end
 
-  def self.create_https_proxy_client(uri, proxy : URI, timeout_seconds : Int32? = nil, insecure : Bool = false)
+  def self.create_https_proxy_client(uri, proxy : URI, timeouts : Timeouts = Timeouts.new, insecure : Bool = false) : PhasedClient
     host = uri.host || raise ArgumentError.new("URI host is required")
     port = effective_port(uri)
     proxy_host = proxy.host || raise ArgumentError.new("Proxy host is required")
     proxy_port = effective_port(proxy)
-    socket = TCPSocket.new(proxy_host, proxy_port)
+
+    connect_start = Time.instant
+    socket = TCPSocket.new(proxy_host, proxy_port, timeouts.connect_seconds, timeouts.connect_seconds)
     socket << connect_request(uri, port, proxy)
 
     status_code = read_proxy_connect_status(socket)
@@ -76,21 +82,27 @@ module Cryload
       socket.close
       raise IO::Error.new("Proxy CONNECT failed with status #{status_code}")
     end
+    connect_ms = elapsed_ms(connect_start)
 
     tls_context = if insecure
                     OpenSSL::SSL::Context::Client.insecure
                   else
                     default_tls_context
                   end
+
+    tls_start = Time.instant
     ssl_socket = OpenSSL::SSL::Socket::Client.new(
       socket,
       context: tls_context,
       sync_close: true,
       hostname: host,
     )
+    tls_ms = elapsed_ms(tls_start)
 
-    client = HTTP::Client.new(ssl_socket, host: host, port: port)
-    apply_timeouts(client, timeout_seconds)
+    # DNS is folded into the CONNECT phase here: the tunnel is established by
+    # the proxy, so the client never resolves the target host itself.
+    client = PhasedClient.new(ssl_socket, host, port, 0.0, connect_ms, tls_ms)
+    timeouts.apply(client)
     client
   end
 
@@ -148,11 +160,44 @@ module Cryload
     context
   end
 
-  def self.apply_timeouts(client : HTTP::Client, timeout_seconds : Int32?)
-    return unless timeout = timeout_seconds
-    span = timeout.seconds
-    client.connect_timeout = span
-    client.read_timeout = span
+  # A request deadline that carries the limit it was derived from, so the error
+  # can name the flag value without reaching back into the config.
+  struct Deadline
+    getter at : Time::Instant
+    getter span : Time::Span
+
+    def initialize(@at : Time::Instant, @span : Time::Span)
+    end
+
+    def exceeded? : Bool
+      Time.instant >= @at
+    end
+  end
+
+  # Socket-level deadlines. v5 set only connect and read, so a peer that
+  # accepted the request and then stopped reading could block a worker forever.
+  struct Timeouts
+    getter timeout : Time::Span?
+    getter request_timeout : Time::Span?
+
+    def initialize(@timeout : Time::Span? = nil, @request_timeout : Time::Span? = nil)
+    end
+
+    def apply(client : HTTP::Client) : Nil
+      return unless span = @timeout
+      client.connect_timeout = span
+      client.read_timeout = span
+      client.write_timeout = span
+    end
+
+    def connect_seconds : Float64?
+      @timeout.try(&.total_seconds)
+    end
+
+    # Absolute deadline for one request, or nil when --request-timeout is unset.
+    def deadline_from(start : Time::Instant) : Deadline?
+      @request_timeout.try { |span| Deadline.new(start + span, span) }
+    end
   end
 
   def self.load_urls_from_file(path : String) : Array(URI)
@@ -173,5 +218,15 @@ module Cryload
   def self.display_url(urls : Array(URI)) : String
     return urls.first.to_s if urls.size == 1
     "#{urls.first} (+#{urls.size - 1} more)"
+  end
+
+  # HTTP::Request mutates the headers object it is handed (Host, Content-Length),
+  # so every worker needs its own copy once the load fibers run in parallel.
+  def self.clone_headers(headers : HTTP::Headers) : HTTP::Headers
+    copy = HTTP::Headers.new
+    headers.each do |name, values|
+      copy[name] = values.size == 1 ? values.first : values
+    end
+    copy
   end
 end

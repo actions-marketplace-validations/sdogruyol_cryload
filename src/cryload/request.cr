@@ -1,73 +1,125 @@
 module Cryload
-  # Represents an HTTP request.
-  class Request
-    REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
-
-    @start_time : Time::Instant
-    @end_time : Time::Instant
-    @status_code : Int32
-    @response_bytes : Int64
-
-    getter :status_code
-    getter :response_bytes
+  # Everything about a request that is identical for every worker, built once
+  # and shared read-only. Keeps the hot path free of a dozen forwarded
+  # arguments and makes what is shared across threads explicit.
+  struct RequestSpec
+    getter method : String
+    getter body : String?
+    getter timeouts : Timeouts
+    getter? insecure : Bool
+    getter? follow_redirects : Bool
+    getter proxy : URI?
 
     def initialize(
-      http_client,
-      uri,
-      method : String,
-      headers : HTTP::Headers,
-      body : String?,
-      timeout_seconds : Int32? = nil,
-      insecure : Bool = false,
-      follow_redirects : Bool = false,
+      @method : String,
+      @body : String? = nil,
+      @timeouts : Timeouts = Timeouts.new,
+      @insecure : Bool = false,
+      @follow_redirects : Bool = false,
       @proxy : URI? = nil,
     )
-      @start_time = Time.instant
-      response = exec_request http_client, uri, method, headers, body, timeout_seconds, insecure, follow_redirects
-      @response_bytes = response.body.to_s.bytesize.to_i64
-      @end_time = Time.instant
-      @status_code = response.status_code
+    end
+  end
+
+  # One measured HTTP request, including any redirect hops it followed.
+  #
+  # The response body is streamed through a caller-owned scratch buffer instead
+  # of being materialised as a String. That removes a per-request allocation
+  # proportional to the response size and is what makes time-to-first-byte
+  # observable at all: the block form of `HTTP::Client#exec` hands the response
+  # over as soon as the status line and headers are parsed.
+  class Request
+    REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+    DRAIN_BUFFER_SIZE     = 32 * 1024
+
+    getter status_code : Int32
+    getter response_bytes : Int64
+    getter total_ms : Float64
+    getter ttfb_ms : Float64
+    getter send_delay_ms : Float64
+    getter corrected_ms : Float64
+    getter dns_ms : Float64?
+    getter connect_ms : Float64?
+    getter tls_ms : Float64?
+
+    def self.buffer : Bytes
+      Bytes.new(DRAIN_BUFFER_SIZE)
     end
 
-    def time_taken
-      (@end_time - @start_time).total_seconds * 1000.0
+    def initialize(
+      client : PhasedClient,
+      uri : URI,
+      spec : RequestSpec,
+      headers : HTTP::Headers,
+      buffer : Bytes,
+      scheduled_at : Time::Instant? = nil,
+    )
+      connections_before = client.connections_opened
+      start_time = Time.instant
+      deadline = spec.timeouts.deadline_from(start_time)
+
+      hop = exec_chain client, uri, spec, headers, buffer, deadline
+      end_time = Time.instant
+
+      @status_code = hop.status_code
+      @response_bytes = hop.response_bytes
+      @ttfb_ms = hop.ttfb_ms
+      @total_ms = (end_time - start_time).total_milliseconds
+
+      if scheduled_at
+        @send_delay_ms = (start_time - scheduled_at).total_milliseconds
+        @corrected_ms = (end_time - scheduled_at).total_milliseconds
+      else
+        @send_delay_ms = 0.0
+        @corrected_ms = @total_ms
+      end
+
+      # Phase timings belong to the connection, not the request: with keep-alive
+      # only the request that opened the connection reports them.
+      if client.connections_opened > connections_before
+        @dns_ms = client.last_dns_ms
+        @connect_ms = client.last_connect_ms
+        @tls_ms = client.last_tls_ms
+      else
+        @dns_ms = nil
+        @connect_ms = nil
+        @tls_ms = nil
+      end
     end
 
-    def ok?
-      (200..299).includes?(@status_code)
-    end
+    record Hop,
+      status_code : Int32,
+      location : String?,
+      response_bytes : Int64,
+      ttfb_ms : Float64
 
-    private def exec_request(http_client, uri, method, headers, body, timeout_seconds : Int32?, insecure : Bool, follow_redirects : Bool)
-      current_client = http_client
+    private def exec_chain(client, uri : URI, spec : RequestSpec, headers : HTTP::Headers, buffer : Bytes, deadline : Deadline?) : Hop
+      current_client = client
       current_uri = uri
-      current_method = method
-      current_body = body
+      current_method = spec.method
+      current_body = spec.body
       redirects_remaining = Cryload::DEFAULT_MAX_REDIRECTS
-      owned_clients = [] of HTTP::Client
+      owned_clients = [] of PhasedClient
 
       begin
         loop do
-          request = HTTP::Request.new(current_method, request_target(current_uri), headers, current_body)
-          response = current_client.exec(request)
+          hop = exec_hop current_client, current_uri, current_method, current_body, headers, spec, buffer, deadline
 
-          unless follow_redirects && redirect?(response) && redirects_remaining > 0
-            return response
+          location = hop.location
+          unless spec.follow_redirects? && REDIRECT_STATUS_CODES.includes?(hop.status_code) && redirects_remaining > 0 && location
+            return hop
           end
 
-          location = response.headers["Location"]?
-          return response unless location
-
-          drain_response_body response
           next_uri = resolve_redirect_uri(current_uri, location)
           redirects_remaining -= 1
 
-          if {301, 302, 303}.includes?(response.status_code) && current_method != "HEAD"
+          if {301, 302, 303}.includes?(hop.status_code) && current_method != "HEAD"
             current_method = "GET"
             current_body = nil
           end
 
           unless same_origin?(current_uri, next_uri)
-            owned_clients << Cryload.create_http_client(next_uri, timeout_seconds, insecure, @proxy)
+            owned_clients << Cryload.create_http_client(next_uri, spec.timeouts, spec.insecure?, spec.proxy)
             current_client = owned_clients.last
           end
 
@@ -78,21 +130,49 @@ module Cryload
       end
     end
 
-    private def request_target(uri : URI) : String
-      if @proxy && uri.scheme == "http"
+    private def exec_hop(client, uri : URI, method : String, body : String?, headers : HTTP::Headers, spec : RequestSpec, buffer : Bytes, deadline : Deadline?) : Hop
+      deadline.try { |limit| raise RequestTimeoutError.new(limit.span) if limit.exceeded? }
+
+      request = HTTP::Request.new(method, request_target(uri, spec), headers, body)
+      sent_at = Time.instant
+      hop = nil
+
+      client.exec(request) do |response|
+        ttfb_ms = (Time.instant - sent_at).total_milliseconds
+        bytes = drain_body response.body_io?, buffer, deadline, spec
+        hop = Hop.new(
+          status_code: response.status_code,
+          location: response.headers["Location"]?,
+          response_bytes: bytes,
+          ttfb_ms: ttfb_ms,
+        )
+      end
+
+      hop || raise IO::EOFError.new("Unexpected end of http response")
+    end
+
+    # Counting bytes through a reused buffer also gives --request-timeout a
+    # place to fire: a peer trickling a body a few bytes at a time never trips
+    # the per-read socket timeout, so only a total deadline can stop it.
+    private def drain_body(body_io : IO?, buffer : Bytes, deadline : Deadline?, spec : RequestSpec) : Int64
+      return 0_i64 unless body_io
+
+      total = 0_i64
+      loop do
+        read = body_io.read(buffer)
+        break if read == 0
+        total += read
+        deadline.try { |limit| raise RequestTimeoutError.new(limit.span) if limit.exceeded? }
+      end
+      total
+    end
+
+    private def request_target(uri : URI, spec : RequestSpec) : String
+      if spec.proxy && uri.scheme == "http"
         Cryload.proxy_request_target(uri)
       else
         uri.request_target
       end
-    end
-
-    private def drain_response_body(response)
-      response.body
-    rescue IO::Error
-    end
-
-    private def redirect?(response)
-      REDIRECT_STATUS_CODES.includes?(response.status_code)
     end
 
     private def same_origin?(left : URI, right : URI)
