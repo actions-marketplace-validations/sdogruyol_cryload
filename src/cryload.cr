@@ -6,6 +6,7 @@ require "base64"
 
 require "./cryload/version"
 require "./cryload/duration"
+require "./cryload/fd_limit"
 require "./cryload/error_category"
 require "./cryload/ci_thresholds"
 require "./cryload/histogram"
