@@ -74,7 +74,9 @@ module Cryload
     proxy_port = effective_port(proxy)
 
     connect_start = Time.instant
-    socket = TCPSocket.new(proxy_host, proxy_port, timeouts.connect_seconds, timeouts.connect_seconds)
+    # Time::Span, not a bare number: the Windows IOCP event loop only accepts a
+    # span, and the numeric overload type-checks on Unix but not there.
+    socket = TCPSocket.new(proxy_host, proxy_port, timeouts.timeout, timeouts.timeout)
     socket << connect_request(uri, port, proxy)
 
     status_code = read_proxy_connect_status(socket)
@@ -188,10 +190,6 @@ module Cryload
       client.connect_timeout = span
       client.read_timeout = span
       client.write_timeout = span
-    end
-
-    def connect_seconds : Float64?
-      @timeout.try(&.total_seconds)
     end
 
     # Absolute deadline for one request, or nil when --request-timeout is unset.
