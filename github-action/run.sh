@@ -7,6 +7,12 @@
 # Outputs are written to $GITHUB_OUTPUT *before* exiting with cryload's own
 # exit code: a threshold breach (--max-p99 etc.) still fails the step, while
 # `if: always()` follow-up steps can consume the outputs.
+#
+# cryload's exit code is a taxonomy in v6, not a boolean: 0 ok, 1 threshold
+# breach, 2 usage/config error, 3 target unreachable, 130 SIGINT, 143
+# SIGTERM. The step therefore fails with a distinguishable code, and the
+# `exit_code` output lets `if: always()` steps branch on it — e.g. treat 1 as
+# a real performance regression but 3 as a service that never came up.
 set -eu
 
 fail() {
@@ -22,24 +28,36 @@ set -- "$INPUT_URL"
 if [ -n "${INPUT_REQUESTS:-}" ]; then set -- "$@" -n "$INPUT_REQUESTS"; fi
 if [ -n "${INPUT_DURATION:-}" ]; then set -- "$@" -d "$INPUT_DURATION"; fi
 if [ -n "${INPUT_CONNECTIONS:-}" ]; then set -- "$@" -c "$INPUT_CONNECTIONS"; fi
+if [ -n "${INPUT_WORKERS:-}" ]; then set -- "$@" --workers "$INPUT_WORKERS"; fi
 if [ -n "${INPUT_METHOD:-}" ]; then set -- "$@" -m "$INPUT_METHOD"; fi
 if [ -n "${INPUT_BODY:-}" ]; then set -- "$@" -b "$INPUT_BODY"; fi
 if [ -n "${INPUT_BASIC_AUTH:-}" ]; then set -- "$@" -a "$INPUT_BASIC_AUTH"; fi
 if [ -n "${INPUT_TIMEOUT:-}" ]; then set -- "$@" --timeout "$INPUT_TIMEOUT"; fi
+if [ -n "${INPUT_REQUEST_TIMEOUT:-}" ]; then set -- "$@" --request-timeout "$INPUT_REQUEST_TIMEOUT"; fi
 if [ -n "${INPUT_RATE:-}" ]; then set -- "$@" -q "$INPUT_RATE"; fi
 if [ -n "${INPUT_WARMUP:-}" ]; then set -- "$@" --warmup "$INPUT_WARMUP"; fi
+if [ -n "${INPUT_LATENCY_CORRECTION:-}" ]; then set -- "$@" --latency-correction "$INPUT_LATENCY_CORRECTION"; fi
 if [ -n "${INPUT_SUCCESS_STATUS:-}" ]; then set -- "$@" --success-status "$INPUT_SUCCESS_STATUS"; fi
 if [ -n "${INPUT_USER_AGENT:-}" ]; then set -- "$@" --user-agent "$INPUT_USER_AGENT"; fi
 if [ -n "${INPUT_HOST_HEADER:-}" ]; then set -- "$@" --host-header "$INPUT_HOST_HEADER"; fi
 if [ -n "${INPUT_PROXY:-}" ]; then set -- "$@" --proxy "$INPUT_PROXY"; fi
 if [ -n "${INPUT_MAX_FAIL_RATE:-}" ]; then set -- "$@" --max-fail-rate "$INPUT_MAX_FAIL_RATE"; fi
+if [ -n "${INPUT_MAX_P50:-}" ]; then set -- "$@" --max-p50 "$INPUT_MAX_P50"; fi
+if [ -n "${INPUT_MAX_P75:-}" ]; then set -- "$@" --max-p75 "$INPUT_MAX_P75"; fi
+if [ -n "${INPUT_MAX_P90:-}" ]; then set -- "$@" --max-p90 "$INPUT_MAX_P90"; fi
+if [ -n "${INPUT_MAX_P95:-}" ]; then set -- "$@" --max-p95 "$INPUT_MAX_P95"; fi
 if [ -n "${INPUT_MAX_P99:-}" ]; then set -- "$@" --max-p99 "$INPUT_MAX_P99"; fi
+if [ -n "${INPUT_MAX_P999:-}" ]; then set -- "$@" --max-p999 "$INPUT_MAX_P999"; fi
+if [ -n "${INPUT_MAX_AVG:-}" ]; then set -- "$@" --max-avg "$INPUT_MAX_AVG"; fi
+if [ -n "${INPUT_MAX_LATENCY:-}" ]; then set -- "$@" --max-latency "$INPUT_MAX_LATENCY"; fi
+if [ -n "${INPUT_MIN_RPS:-}" ]; then set -- "$@" --min-rps "$INPUT_MIN_RPS"; fi
 
 if [ "${INPUT_FOLLOW_REDIRECTS:-false}" = "true" ]; then set -- "$@" --follow-redirects; fi
 if [ "${INPUT_DISABLE_KEEPALIVE:-false}" = "true" ]; then set -- "$@" --disable-keepalive; fi
 if [ "${INPUT_INSECURE:-false}" = "true" ]; then set -- "$@" --insecure; fi
 if [ "${INPUT_FAIL_ON_ERROR:-false}" = "true" ]; then set -- "$@" --fail-on-error; fi
 if [ "${INPUT_FAIL_ON_TRANSPORT_ERROR:-false}" = "true" ]; then set -- "$@" --fail-on-transport-error; fi
+if [ "${INPUT_FAIL_ON_RATE_MISS:-false}" = "true" ]; then set -- "$@" --fail-on-rate-miss; fi
 
 # headers/cookies are multiline inputs: one `Key: Value` / `name=value` per
 # line, mapped to the repeatable -H / --cookie flags. The heredoc keeps the
@@ -59,6 +77,18 @@ if [ -n "${INPUT_COOKIES:-}" ]; then
     set -- "$@" --cookie "$line"
   done <<EOF
 $INPUT_COOKIES
+EOF
+fi
+
+# url_thresholds is a multiline input: one `PATTERN METRIC VALUE` per line,
+# mapped to the repeatable --url-threshold flag. Each line is passed as a
+# single argv element, so the three fields stay together.
+if [ -n "${INPUT_URL_THRESHOLDS:-}" ]; then
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    set -- "$@" --url-threshold "$line"
+  done <<EOF
+$INPUT_URL_THRESHOLDS
 EOF
 fi
 
@@ -85,7 +115,14 @@ if [ "$output_format" = "json" ] && jq -e . "$report" >/dev/null 2>&1; then
     echo "requests_per_second=$(jq -r '.summary.requests_per_second' "$report")"
     echo "failure_rate_percent=$(jq -r '.summary.failure_rate_percent' "$report")"
     echo "p50=$(jq -r '.latency_ms.p50' "$report")"
+    echo "p95=$(jq -r '.latency_ms.p95' "$report")"
     echo "p99=$(jq -r '.latency_ms.p99' "$report")"
+    echo "corrected_p99=$(jq -r '.corrected_latency_ms.p99' "$report")"
+    # .rate.* is null unless --rate was used; emit an empty string so
+    # consumers branch on "" instead of the literal string "null".
+    echo "rate_attainment_percent=$(jq -r '.rate.attainment_percent // ""' "$report")"
+    echo "thresholds_passed=$(jq -r '.thresholds.passed' "$report")"
+    echo "schema_version=$(jq -r '.schema_version' "$report")"
   } >> "$github_output"
 fi
 

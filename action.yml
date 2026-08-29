@@ -1,5 +1,8 @@
 ---
 name: Cryload Load Test
+# NOTE: GitHub Marketplace rejects listings whose description is 125
+# characters or longer (this blocked publishing v5.2.0 — see CHANGELOG
+# 5.2.1). The description below is 117 characters. Keep it under 125.
 description: HTTP load testing for CI/CD — benchmark a URL with pass/fail latency and error-rate thresholds, and JSON step outputs
 branding:
   icon: activity
@@ -10,9 +13,12 @@ branding:
 # on Linux, macOS, and Windows runners and lets it reach services listening
 # on the runner's localhost, the primary CI use case.
 #
-# File-based flags (--body-file, --body-stdin, --urls-file, --random-path)
-# are intentionally not exposed as inputs: the install step puts `cryload`
-# on PATH, so follow-up `run:` steps can use the full CLI directly.
+# File-based and generator flags (--urls-file, --body-file, --body-stdin,
+# --random-path) remain deliberately unexposed as inputs: the install step
+# puts `cryload` on PATH, so follow-up `run:` steps can use the full CLI
+# directly — that is also how you benchmark a whole list of URLs in one run.
+# `url_thresholds` needs no URL list: configuring one per-URL gate switches
+# on per-URL tracking (the JSON `by_url` block) by itself.
 
 inputs:
   url:
@@ -23,11 +29,15 @@ inputs:
     required: false
     default: ""
   duration:
-    description: Test duration in seconds (-d); mutually exclusive with requests
+    description: Test duration (-d); accepts units (30, 30s, 2m, 500ms), bare number is seconds; mutually exclusive with requests
     required: false
     default: ""
   connections:
     description: "Number of concurrent connections (-c, CLI default: 10)"
+    required: false
+    default: ""
+  workers:
+    description: "OS threads used to run the load fibers (--workers, CLI default: min(cpu_count, connections)); 1 reproduces single-core behaviour"
     required: false
     default: ""
   method:
@@ -51,15 +61,23 @@ inputs:
     required: false
     default: ""
   timeout:
-    description: Connect/read timeout in seconds (--timeout)
+    description: Connect/read/write timeout (--timeout); accepts units, bare number is seconds
+    required: false
+    default: ""
+  request_timeout:
+    description: Total wall-clock deadline for one request including body download (--request-timeout); accepts units
     required: false
     default: ""
   rate:
-    description: Total request rate limit in requests/sec (-q)
+    description: Total request rate limit in requests/sec, fractional allowed (-q)
     required: false
     default: ""
   warmup:
-    description: Warmup seconds before the timed benchmark (--warmup)
+    description: Warmup before the timed benchmark (--warmup); accepts units, bare number is seconds
+    required: false
+    default: ""
+  latency_correction:
+    description: "Evaluate thresholds against coordinated-omission-corrected latency: on or off (--latency-correction, CLI default: on)"
     required: false
     default: ""
   follow_redirects:
@@ -98,12 +116,52 @@ inputs:
     description: Fail the step when any transport error occurs (--fail-on-transport-error)
     required: false
     default: "false"
+  fail_on_rate_miss:
+    description: Fail the step when the attained rate is more than 1% below rate (--fail-on-rate-miss)
+    required: false
+    default: "false"
   max_fail_rate:
     description: Fail the step when failure rate exceeds this percentage (--max-fail-rate)
     required: false
     default: ""
+  max_p50:
+    description: Fail the step when p50 latency exceeds this many milliseconds (--max-p50)
+    required: false
+    default: ""
+  max_p75:
+    description: Fail the step when p75 latency exceeds this many milliseconds (--max-p75)
+    required: false
+    default: ""
+  max_p90:
+    description: Fail the step when p90 latency exceeds this many milliseconds (--max-p90)
+    required: false
+    default: ""
+  max_p95:
+    description: Fail the step when p95 latency exceeds this many milliseconds (--max-p95)
+    required: false
+    default: ""
   max_p99:
     description: Fail the step when p99 latency exceeds this many milliseconds (--max-p99)
+    required: false
+    default: ""
+  max_p999:
+    description: Fail the step when p99.9 latency exceeds this many milliseconds (--max-p999)
+    required: false
+    default: ""
+  max_avg:
+    description: Fail the step when average latency exceeds this many milliseconds (--max-avg)
+    required: false
+    default: ""
+  max_latency:
+    description: Fail the step when the maximum observed latency exceeds this many milliseconds (--max-latency)
+    required: false
+    default: ""
+  min_rps:
+    description: Fail the step when throughput is below this many requests/sec (--min-rps)
+    required: false
+    default: ""
+  url_thresholds:
+    description: "Per-endpoint gates, one 'PATTERN METRIC VALUE' per line (repeatable --url-threshold)"
     required: false
     default: ""
   output_format:
@@ -131,11 +189,26 @@ outputs:
   p50:
     description: Median latency in milliseconds
     value: ${{ steps.run.outputs.p50 }}
+  p95:
+    description: p95 latency in milliseconds
+    value: ${{ steps.run.outputs.p95 }}
   p99:
     description: p99 latency in milliseconds
     value: ${{ steps.run.outputs.p99 }}
+  corrected_p99:
+    description: Coordinated-omission-corrected p99 latency in milliseconds; equals p99 when rate is unset
+    value: ${{ steps.run.outputs.corrected_p99 }}
+  rate_attainment_percent:
+    description: Attained rate as a percentage of the requested rate; empty when rate is unset
+    value: ${{ steps.run.outputs.rate_attainment_percent }}
+  thresholds_passed:
+    description: "true when every configured threshold passed"
+    value: ${{ steps.run.outputs.thresholds_passed }}
+  schema_version:
+    description: Version of the JSON report schema the outputs were read from
+    value: ${{ steps.run.outputs.schema_version }}
   exit_code:
-    description: cryload's exit code (1 on threshold breach)
+    description: "cryload's exit code: 0 ok, 1 threshold breach, 2 usage/config error, 3 target unreachable, 130 SIGINT, 143 SIGTERM"
     value: ${{ steps.run.outputs.exit_code }}
 
 runs:
@@ -165,14 +238,17 @@ runs:
         INPUT_REQUESTS: ${{ inputs.requests }}
         INPUT_DURATION: ${{ inputs.duration }}
         INPUT_CONNECTIONS: ${{ inputs.connections }}
+        INPUT_WORKERS: ${{ inputs.workers }}
         INPUT_METHOD: ${{ inputs.method }}
         INPUT_BODY: ${{ inputs.body }}
         INPUT_HEADERS: ${{ inputs.headers }}
         INPUT_COOKIES: ${{ inputs.cookies }}
         INPUT_BASIC_AUTH: ${{ inputs.basic_auth }}
         INPUT_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_REQUEST_TIMEOUT: ${{ inputs.request_timeout }}
         INPUT_RATE: ${{ inputs.rate }}
         INPUT_WARMUP: ${{ inputs.warmup }}
+        INPUT_LATENCY_CORRECTION: ${{ inputs.latency_correction }}
         INPUT_FOLLOW_REDIRECTS: ${{ inputs.follow_redirects }}
         INPUT_DISABLE_KEEPALIVE: ${{ inputs.disable_keepalive }}
         INPUT_INSECURE: ${{ inputs.insecure }}
@@ -182,7 +258,17 @@ runs:
         INPUT_PROXY: ${{ inputs.proxy }}
         INPUT_FAIL_ON_ERROR: ${{ inputs.fail_on_error }}
         INPUT_FAIL_ON_TRANSPORT_ERROR: ${{ inputs.fail_on_transport_error }}
+        INPUT_FAIL_ON_RATE_MISS: ${{ inputs.fail_on_rate_miss }}
         INPUT_MAX_FAIL_RATE: ${{ inputs.max_fail_rate }}
+        INPUT_MAX_P50: ${{ inputs.max_p50 }}
+        INPUT_MAX_P75: ${{ inputs.max_p75 }}
+        INPUT_MAX_P90: ${{ inputs.max_p90 }}
+        INPUT_MAX_P95: ${{ inputs.max_p95 }}
         INPUT_MAX_P99: ${{ inputs.max_p99 }}
+        INPUT_MAX_P999: ${{ inputs.max_p999 }}
+        INPUT_MAX_AVG: ${{ inputs.max_avg }}
+        INPUT_MAX_LATENCY: ${{ inputs.max_latency }}
+        INPUT_MIN_RPS: ${{ inputs.min_rps }}
+        INPUT_URL_THRESHOLDS: ${{ inputs.url_thresholds }}
         INPUT_OUTPUT_FORMAT: ${{ inputs.output_format }}
       run: sh "$GITHUB_ACTION_PATH/github-action/run.sh"
